@@ -1,0 +1,22 @@
+{
+  "name": "poweremail-direct-dispatcher",
+  "version": "0.1.0",
+  "description": "Direct broadcast dispatcher for PowerEmail without Sendy as scheduler",
+  "main": "src/campaign-intake.js",
+  "type": "commonjs",
+  "scripts": {
+    "intake": "node src/campaign-intake.js",
+    "resolve": "node src/audience-resolver.js",
+    "plan-batches": "node src/batch-planner.js",
+    "execute": "node src/relay-executor.js",
+    "check:intake": "node --check src/campaign-intake.js",
+    "check:resolve": "node --check src/audience-resolver.js",
+    "check:plan": "node --check src/batch-planner.js",
+    "check:execute": "node --check src/relay-executor.js"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.3",
+    "nodemailer": "^6.9.15",
+    "pg": "^8.12.0"
+  }
+}
