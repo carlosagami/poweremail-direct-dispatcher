@@ -1,0 +1,8 @@
+
+# Local secrets
+.env
+
+# Local artifacts
+node_modules/
+recipients_332.csv
+src/*.bak.*
