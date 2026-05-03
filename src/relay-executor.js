@@ -6,6 +6,15 @@ const logger = require("./logger");
 const { chunkError } = require("./utils");
 const { personalizeText } = require("./personalize");
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getSendDelayMs(config) {
+  const rate = Number(config.maxMsgsPerSecond || 1);
+  return Math.ceil(1000 / Math.max(rate, 0.1));
+}
+
 async function loadBatch(cpDb, sendyCampaignId, tenantKey) {
   const { rows } = await cpDb.query(
     `
@@ -41,7 +50,7 @@ async function loadContent(cpDb, contentSnapshotId) {
   return rows[0] || null;
 }
 
-async function loadRecipients(cpDb, dispatchCampaignId, batchKey) {
+async function loadRecipients(cpDb, dispatchCampaignId, batchKey, limit) {
   const { rows } = await cpDb.query(
     `
     SELECT *
@@ -50,8 +59,9 @@ async function loadRecipients(cpDb, dispatchCampaignId, batchKey) {
       AND batch_key = $2
       AND recipient_state = 'batched'
     ORDER BY sendy_subscriber_id ASC
+    LIMIT $3
     `,
-    [dispatchCampaignId, batchKey]
+    [dispatchCampaignId, batchKey, Math.max(Number(limit || 25), 1)]
   );
   return rows;
 }
@@ -97,6 +107,138 @@ async function markAttempt(cpDb, batch, tenantId, executionMode, resultStatus, c
   return rows[0].delivery_attempt_id;
 }
 
+async function markDispatchRunning(cpDb, batch) {
+  await cpDb.query(
+    `
+    UPDATE control_plane.sendy_campaign_registry
+       SET direct_dispatch_state = 'running',
+           started_at = COALESCE(started_at, now()),
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+       AND direct_dispatch_state IN ('pending', 'snapshotted', 'batched')
+    `,
+    [batch.dispatch_campaign_id]
+  );
+
+  await cpDb.query(
+    `
+    UPDATE control_plane.campaign_dispatch_queue
+       SET queue_state = 'running',
+           started_at = COALESCE(started_at, now()),
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+       AND queue_state IN ('queued', 'reserved', 'launching', 'retry_wait')
+    `,
+    [batch.dispatch_campaign_id]
+  );
+}
+
+async function finishBatchOrRequeue(db, batch) {
+  const { rows } = await db.query(
+    `
+    SELECT count(*)::int AS remaining
+    FROM control_plane.campaign_recipient_queue
+    WHERE dispatch_campaign_id = $1
+      AND batch_key = $2
+      AND recipient_state = 'batched'
+    `,
+    [batch.dispatch_campaign_id, batch.batch_key]
+  );
+
+  const remaining = rows[0]?.remaining || 0;
+  if (remaining > 0) {
+    await db.query(
+      `
+      UPDATE control_plane.campaign_delivery_batches
+         SET batch_state = 'queued',
+             updated_at = now()
+       WHERE delivery_batch_id = $1
+      `,
+      [batch.delivery_batch_id]
+    );
+    return "queued";
+  }
+
+  await db.query(
+    `
+    UPDATE control_plane.campaign_delivery_batches
+       SET batch_state = 'completed',
+           finished_at = COALESCE(finished_at, now()),
+           updated_at = now()
+     WHERE delivery_batch_id = $1
+    `,
+    [batch.delivery_batch_id]
+  );
+  return "completed";
+}
+
+async function closeDispatchIfDone(cpDb, batch) {
+  const { rows } = await cpDb.query(
+    `
+    SELECT
+      count(*) FILTER (WHERE batch_state IN ('queued', 'reserved', 'running'))::int AS open_batches,
+      count(*) FILTER (WHERE batch_state = 'failed')::int AS failed_batches
+    FROM control_plane.campaign_delivery_batches
+    WHERE dispatch_campaign_id = $1
+    `,
+    [batch.dispatch_campaign_id]
+  );
+
+  const openBatches = rows[0]?.open_batches || 0;
+  const failedBatches = rows[0]?.failed_batches || 0;
+
+  if (openBatches > 0) return "running";
+
+  if (failedBatches > 0) {
+    await cpDb.query(
+      `
+      UPDATE control_plane.campaign_dispatch_queue
+         SET queue_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $1
+      `,
+      [batch.dispatch_campaign_id]
+    );
+
+    await cpDb.query(
+      `
+      UPDATE control_plane.sendy_campaign_registry
+         SET direct_dispatch_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $1
+      `,
+      [batch.dispatch_campaign_id]
+    );
+    return "failed";
+  }
+
+  await cpDb.query(
+    `
+    UPDATE control_plane.campaign_dispatch_queue
+       SET queue_state = 'completed',
+           finished_at = COALESCE(finished_at, now()),
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+    `,
+    [batch.dispatch_campaign_id]
+  );
+
+  await cpDb.query(
+    `
+    UPDATE control_plane.sendy_campaign_registry
+       SET direct_dispatch_state = 'completed',
+           finished_at = COALESCE(finished_at, now()),
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+    `,
+    [batch.dispatch_campaign_id]
+  );
+
+  return "completed";
+}
+
 async function executeDryRun(cpDb, batch, recipients) {
   await cpDb.tx(async (client) => {
     await client.query(
@@ -122,16 +264,7 @@ async function executeDryRun(cpDb, batch, recipients) {
       [batch.dispatch_campaign_id, batch.batch_key]
     );
 
-    await client.query(
-      `
-      UPDATE control_plane.campaign_delivery_batches
-         SET batch_state = 'completed',
-             finished_at = now(),
-             updated_at = now()
-       WHERE delivery_batch_id = $1
-      `,
-      [batch.delivery_batch_id]
-    );
+    await finishBatchOrRequeue(client, batch);
   });
 
   await markAttempt(
@@ -211,18 +344,11 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         `,
         [recipient.recipient_queue_id]
       );
+
+      await sleep(getSendDelayMs(config));
     }
 
-    await cpDb.query(
-      `
-      UPDATE control_plane.campaign_delivery_batches
-         SET batch_state = 'completed',
-             finished_at = now(),
-             updated_at = now()
-       WHERE delivery_batch_id = $1
-      `,
-      [batch.delivery_batch_id]
-    );
+    await finishBatchOrRequeue(cpDb, batch);
 
     await markAttempt(
       cpDb,
@@ -296,14 +422,18 @@ async function main() {
     const recipients = await loadRecipients(
       cpDb,
       batch.dispatch_campaign_id,
-      batch.batch_key
+      batch.batch_key,
+      config.maxRecipientsPerRun
     );
     if (recipients.length === 0) {
       throw new Error("Batch has no batched recipients");
     }
 
+    await markDispatchRunning(cpDb, batch);
+
     if (config.executionMode === "dry-run") {
       await executeDryRun(cpDb, batch, recipients);
+      await closeDispatchIfDone(cpDb, batch);
       logger.info("relay_executor.completed", {
         execution_mode: "dry-run",
         sendy_campaign_id: config.sendyCampaignId,
@@ -315,6 +445,7 @@ async function main() {
 
     if (config.executionMode === "smtp-relay") {
       await executeSmtpRelay(cpDb, config, batch, recipients, content);
+      await closeDispatchIfDone(cpDb, batch);
       logger.info("relay_executor.completed", {
         execution_mode: "smtp-relay",
         sendy_campaign_id: config.sendyCampaignId,

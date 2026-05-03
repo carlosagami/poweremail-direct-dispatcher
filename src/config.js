@@ -27,6 +27,17 @@ function intEnv(name, fallback) {
   return parsed;
 }
 
+
+function floatEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = parseFloat(value);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    throw new Error(`Invalid positive number env ${name}=${value}`);
+  }
+  return parsed;
+}
+
 function boolEnv(name, fallback = false) {
   const value = process.env[name];
   if (value == null || value === "") return fallback;
@@ -55,6 +66,8 @@ function loadConfig() {
     sendyCampaignId: intEnv("DIRECT_DISPATCHER_SENDY_CAMPAIGN_ID", 0),
     batchSize: intEnv("DIRECT_DISPATCHER_BATCH_SIZE", 250),
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
+    maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
+    maxRecipientsPerRun: intEnv("DIRECT_DISPATCHER_MAX_RECIPIENTS_PER_RUN", 25),
     relaySmtpHost: process.env.RELAY_SMTP_HOST || "",
     relaySmtpPort: intEnv("RELAY_SMTP_PORT", 587),
     relaySmtpSecure: boolEnv("RELAY_SMTP_SECURE", false),
