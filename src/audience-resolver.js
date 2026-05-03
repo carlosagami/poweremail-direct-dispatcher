@@ -25,13 +25,22 @@ async function loadRegistry(cpDb, sendyCampaignId, tenantKey) {
 
 async function resolveRecipients(sendyDb, snapshot) {
   const campaign = snapshot.sendy_snapshot_json;
-  const lists = parseCsvIds(campaign.lists);
+
+  // Sendy clears campaigns.lists after launch/preparation and keeps the
+  // materialized target lists in campaigns.to_send_lists.
+  // For direct-dispatch snapshots, prefer lists when present, otherwise
+  // fall back to to_send_lists.
+  const sourceLists = campaign.lists || campaign.to_send_lists;
+
+  const lists = parseCsvIds(sourceLists);
   const listsExcl = parseCsvIds(campaign.lists_excl);
   const segs = parseCsvIds(campaign.segs);
   const segsExcl = parseCsvIds(campaign.segs_excl);
 
   if (lists.length === 0 && segs.length === 0) {
-    throw new Error("Campaign has no lists or segments to resolve");
+    throw new Error(
+      "Campaign has no lists, to_send_lists, or segments to resolve"
+    );
   }
 
   const where = [
