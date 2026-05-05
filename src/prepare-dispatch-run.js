@@ -458,6 +458,85 @@ function printCountSection(title, total, byState) {
   }
 }
 
+function buildPrepareDryRunPlan(context, verdict) {
+  const sent = context.recipients.byState.sent || 0;
+  const sending = context.recipients.byState.sending || 0;
+  const dryRunSent = context.recipients.byState.dry_run_sent || 0;
+  const completedBatches = context.batches.byState.completed || 0;
+  const runningBatches = context.batches.byState.running || 0;
+
+  const blockers = [];
+
+  if (verdict !== 'READY_FOR_DRY_RUN') {
+    blockers.push(`audit verdict is ${verdict}`);
+  }
+
+  if (sent > 0) {
+    blockers.push('campaign has sent recipients');
+  }
+
+  if (sending > 0) {
+    blockers.push('campaign has recipients currently sending');
+  }
+
+  if (runningBatches > 0) {
+    blockers.push('campaign has running batches');
+  }
+
+  if (context.registry && context.registry.direct_dispatch_state === 'completed') {
+    blockers.push('campaign is completed');
+  }
+
+  if (context.dispatchQueue.exists && context.dispatchQueue.row.queue_state === 'completed') {
+    blockers.push('dispatch queue is completed');
+  }
+
+  if (blockers.length > 0) {
+    return {
+      status: 'blocked',
+      blockers,
+      plannedChanges: [],
+      note: 'No DB state will be modified.',
+    };
+  }
+
+  const plannedChanges = [
+    `recipients dry_run_sent -> batched: ${dryRunSent}`,
+    `batches completed -> queued: ${completedBatches}`,
+    'registry direct_dispatch_state -> batched',
+    'dispatch queue queue_state -> queued',
+  ];
+
+  return {
+    status: 'ready',
+    blockers: [],
+    plannedChanges,
+    note: 'Plan mode only; no DB state will be modified.',
+  };
+}
+
+function printPrepareDryRunPlan(plan) {
+  console.log('');
+  console.log('Prepare dry-run');
+  console.log(`  status: ${plan.status}`);
+
+  if (plan.blockers.length > 0) {
+    console.log('  blockers:');
+    for (const blocker of plan.blockers) {
+      console.log(`    - ${blocker}`);
+    }
+  }
+
+  if (plan.plannedChanges.length > 0) {
+    console.log('  plannedChanges:');
+    for (const change of plan.plannedChanges) {
+      console.log(`    - ${change}`);
+    }
+  }
+
+  console.log(`  note: ${plan.note}`);
+}
+
 function buildReport(context, warnings, verdict) {
   return {
     config: context.config,
@@ -602,10 +681,8 @@ async function main() {
       printReport(context, warnings, verdict);
 
       if (args.prepareDryRun) {
-        console.log('');
-        console.log('Prepare dry-run');
-        console.log('  status: not implemented');
-        console.log('  note: audit completed only; no DB state was modified.');
+        const prepareDryRunPlan = buildPrepareDryRunPlan(context, verdict);
+        printPrepareDryRunPlan(prepareDryRunPlan);
       }
     }
 
