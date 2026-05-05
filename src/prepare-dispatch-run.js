@@ -6,6 +6,7 @@ const { createControlPlaneDb } = require('./db');
 
 function parseArgs(argv) {
   let dispatchCampaignId = null;
+  let sendyCampaignId = null;
   let audit = false;
   let json = false;
 
@@ -33,6 +34,17 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (token === '--sendy-campaign-id') {
+      const value = argv[i + 1];
+      if (!value) {
+        throw new Error('Missing value for --sendy-campaign-id');
+      }
+
+      sendyCampaignId = Number(value);
+      i += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${token}`);
   }
 
@@ -40,12 +52,25 @@ function parseArgs(argv) {
     audit = true;
   }
 
-  if (!Number.isInteger(dispatchCampaignId) || dispatchCampaignId <= 0) {
+  if (dispatchCampaignId != null && (!Number.isInteger(dispatchCampaignId) || dispatchCampaignId <= 0)) {
     throw new Error('--dispatch-campaign-id must be a positive integer');
+  }
+
+  if (sendyCampaignId != null && (!Number.isInteger(sendyCampaignId) || sendyCampaignId <= 0)) {
+    throw new Error('--sendy-campaign-id must be a positive integer');
+  }
+
+  if (dispatchCampaignId == null && sendyCampaignId == null) {
+    throw new Error('Either --dispatch-campaign-id or --sendy-campaign-id is required');
+  }
+
+  if (dispatchCampaignId != null && sendyCampaignId != null) {
+    throw new Error('Use only one of --dispatch-campaign-id or --sendy-campaign-id');
   }
 
   return {
     dispatchCampaignId,
+    sendyCampaignId,
     audit,
     json,
   };
@@ -130,6 +155,35 @@ async function fetchRegistry(db, dispatchCampaignId) {
     `,
     [dispatchCampaignId]
   );
+
+  return result.rows[0] || null;
+}
+
+async function fetchRegistryBySendyCampaignId(db, sendyCampaignId) {
+  const result = await db.query(
+    `
+      SELECT
+        dispatch_campaign_id,
+        tenant_id,
+        tenant_key,
+        sendy_campaign_id,
+        campaign_state,
+        direct_dispatch_state,
+        content_snapshot_id,
+        audience_snapshot_id,
+        created_at,
+        updated_at
+      FROM control_plane.sendy_campaign_registry
+      WHERE sendy_campaign_id = $1
+      ORDER BY dispatch_campaign_id DESC
+      LIMIT 2
+    `,
+    [sendyCampaignId]
+  );
+
+  if (result.rows.length > 1) {
+    throw new Error(`Multiple registry rows found for sendy_campaign_id=${sendyCampaignId}`);
+  }
 
   return result.rows[0] || null;
 }
@@ -493,24 +547,30 @@ async function main() {
   const db = createControlPlaneDb(config);
 
   try {
-    const registry = await fetchRegistry(db, args.dispatchCampaignId);
+    const registry = args.dispatchCampaignId != null
+      ? await fetchRegistry(db, args.dispatchCampaignId)
+      : await fetchRegistryBySendyCampaignId(db, args.sendyCampaignId);
+
+    const resolvedDispatchCampaignId = registry
+      ? Number(registry.dispatch_campaign_id)
+      : args.dispatchCampaignId;
 
     const recipients = await fetchGroupedCounts(
       db,
       'campaign_recipient_queue',
       'recipient_state',
-      args.dispatchCampaignId
+      resolvedDispatchCampaignId
     );
 
     const batches = await fetchGroupedCounts(
       db,
       'campaign_delivery_batches',
       'batch_state',
-      args.dispatchCampaignId
+      resolvedDispatchCampaignId
     );
 
-    const attempts = await fetchAttemptSummary(db, args.dispatchCampaignId);
-    const dispatchQueue = await fetchDispatchQueue(db, args.dispatchCampaignId);
+    const attempts = await fetchAttemptSummary(db, resolvedDispatchCampaignId);
+    const dispatchQueue = await fetchDispatchQueue(db, resolvedDispatchCampaignId);
 
     const context = {
       input: args,
