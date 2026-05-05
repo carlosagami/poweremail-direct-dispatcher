@@ -66,6 +66,50 @@ function totalFromMap(map) {
   return Object.values(map).reduce((sum, value) => sum + Number(value || 0), 0);
 }
 
+function toNumberOrNull(value) {
+  if (value == null) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    return value;
+  }
+
+  return parsed;
+}
+
+function normalizeRegistry(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    dispatch_campaign_id: toNumberOrNull(row.dispatch_campaign_id),
+    tenant_id: toNumberOrNull(row.tenant_id),
+    sendy_campaign_id: toNumberOrNull(row.sendy_campaign_id),
+    content_snapshot_id: toNumberOrNull(row.content_snapshot_id),
+    audience_snapshot_id: toNumberOrNull(row.audience_snapshot_id),
+  };
+}
+
+function normalizeDispatchQueue(dispatchQueue) {
+  if (!dispatchQueue.exists || !dispatchQueue.row) {
+    return dispatchQueue;
+  }
+
+  return {
+    exists: true,
+    row: {
+      ...dispatchQueue.row,
+      dispatch_id: toNumberOrNull(dispatchQueue.row.dispatch_id),
+      dispatch_campaign_id: toNumberOrNull(dispatchQueue.row.dispatch_campaign_id),
+      tenant_id: toNumberOrNull(dispatchQueue.row.tenant_id),
+    },
+  };
+}
+
 async function fetchRegistry(db, dispatchCampaignId) {
   const result = await db.query(
     `
@@ -356,11 +400,11 @@ function printCountSection(title, total, byState) {
 function buildReport(context, warnings, verdict) {
   return {
     config: context.config,
-    campaign: context.registry,
+    campaign: normalizeRegistry(context.registry),
     recipients: context.recipients,
     batches: context.batches,
     attempts: context.attempts,
-    dispatchQueue: context.dispatchQueue,
+    dispatchQueue: normalizeDispatchQueue(context.dispatchQueue),
     warnings,
     verdict,
     recommendation: buildRecommendation(verdict),
