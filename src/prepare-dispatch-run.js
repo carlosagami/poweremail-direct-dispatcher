@@ -9,6 +9,7 @@ function parseArgs(argv) {
   let sendyCampaignId = null;
   let audit = false;
   let json = false;
+  let prepareDryRun = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -20,6 +21,11 @@ function parseArgs(argv) {
 
     if (token === '--json') {
       json = true;
+      continue;
+    }
+
+    if (token === '--prepare-dry-run') {
+      prepareDryRun = true;
       continue;
     }
 
@@ -73,6 +79,7 @@ function parseArgs(argv) {
     sendyCampaignId,
     audit,
     json,
+    prepareDryRun,
   };
 }
 
@@ -593,6 +600,13 @@ async function main() {
       console.log(JSON.stringify(buildReport(context, warnings, verdict), null, 2));
     } else {
       printReport(context, warnings, verdict);
+
+      if (args.prepareDryRun) {
+        console.log('');
+        console.log('Prepare dry-run');
+        console.log('  status: not implemented');
+        console.log('  note: audit completed only; no DB state was modified.');
+      }
     }
 
     process.exitCode = verdict === 'READY_FOR_DRY_RUN' ? 0 : 1;
