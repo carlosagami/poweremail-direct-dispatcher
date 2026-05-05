@@ -7,12 +7,18 @@ const { createControlPlaneDb } = require('./db');
 function parseArgs(argv) {
   let dispatchCampaignId = null;
   let audit = false;
+  let json = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
 
     if (token === '--audit') {
       audit = true;
+      continue;
+    }
+
+    if (token === '--json') {
+      json = true;
       continue;
     }
 
@@ -41,6 +47,7 @@ function parseArgs(argv) {
   return {
     dispatchCampaignId,
     audit,
+    json,
   };
 }
 
@@ -346,6 +353,20 @@ function printCountSection(title, total, byState) {
   }
 }
 
+function buildReport(context, warnings, verdict) {
+  return {
+    config: context.config,
+    campaign: context.registry,
+    recipients: context.recipients,
+    batches: context.batches,
+    attempts: context.attempts,
+    dispatchQueue: context.dispatchQueue,
+    warnings,
+    verdict,
+    recommendation: buildRecommendation(verdict),
+  };
+}
+
 function printReport(context, warnings, verdict) {
   console.log('PowerEmail Direct Dispatcher Audit');
   console.log('');
@@ -464,7 +485,11 @@ async function main() {
     const warnings = buildWarnings(context);
     const verdict = buildVerdict(context);
 
-    printReport(context, warnings, verdict);
+    if (args.json) {
+      console.log(JSON.stringify(buildReport(context, warnings, verdict), null, 2));
+    } else {
+      printReport(context, warnings, verdict);
+    }
 
     process.exitCode = verdict === 'READY_FOR_DRY_RUN' ? 0 : 1;
   } finally {
