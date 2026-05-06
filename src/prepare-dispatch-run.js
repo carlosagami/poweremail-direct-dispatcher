@@ -6,7 +6,7 @@ const { createControlPlaneDb } = require('./db');
 
 function parseArgs(argv) {
   let dispatchCampaignId = null;
-  let sendyCampaignId = null;
+  let expectedSendyCampaignId = null;
   let audit = false;
   let json = false;
   let prepareDryRun = false;
@@ -52,13 +52,13 @@ function parseArgs(argv) {
       continue;
     }
 
-    if (token === '--sendy-campaign-id') {
+    if (token === '--expected-sendy-campaign-id') {
       const value = argv[i + 1];
       if (!value) {
-        throw new Error('Missing value for --sendy-campaign-id');
+        throw new Error('Missing value for --expected-sendy-campaign-id');
       }
 
-      sendyCampaignId = Number(value);
+      expectedSendyCampaignId = Number(value);
       i += 1;
       continue;
     }
@@ -74,21 +74,17 @@ function parseArgs(argv) {
     throw new Error('--dispatch-campaign-id must be a positive integer');
   }
 
-  if (sendyCampaignId != null && (!Number.isInteger(sendyCampaignId) || sendyCampaignId <= 0)) {
-    throw new Error('--sendy-campaign-id must be a positive integer');
+  if (expectedSendyCampaignId != null && (!Number.isInteger(expectedSendyCampaignId) || expectedSendyCampaignId <= 0)) {
+    throw new Error('--expected-sendy-campaign-id must be a positive integer');
   }
 
-  if (dispatchCampaignId == null && sendyCampaignId == null) {
-    throw new Error('Either --dispatch-campaign-id or --sendy-campaign-id is required');
-  }
-
-  if (dispatchCampaignId != null && sendyCampaignId != null) {
-    throw new Error('Use only one of --dispatch-campaign-id or --sendy-campaign-id');
+  if (dispatchCampaignId == null) {
+    throw new Error('--dispatch-campaign-id is required');
   }
 
   return {
     dispatchCampaignId,
-    sendyCampaignId,
+    expectedSendyCampaignId,
     audit,
     json,
     prepareDryRun,
@@ -176,35 +172,6 @@ async function fetchRegistry(db, dispatchCampaignId) {
     `,
     [dispatchCampaignId]
   );
-
-  return result.rows[0] || null;
-}
-
-async function fetchRegistryBySendyCampaignId(db, sendyCampaignId) {
-  const result = await db.query(
-    `
-      SELECT
-        dispatch_campaign_id,
-        tenant_id,
-        tenant_key,
-        sendy_campaign_id,
-        campaign_state,
-        direct_dispatch_state,
-        content_snapshot_id,
-        audience_snapshot_id,
-        created_at,
-        updated_at
-      FROM control_plane.sendy_campaign_registry
-      WHERE sendy_campaign_id = $1
-      ORDER BY dispatch_campaign_id DESC
-      LIMIT 2
-    `,
-    [sendyCampaignId]
-  );
-
-  if (result.rows.length > 1) {
-    throw new Error(`Multiple registry rows found for sendy_campaign_id=${sendyCampaignId}`);
-  }
 
   return result.rows[0] || null;
 }
@@ -378,6 +345,18 @@ function buildWarnings(context) {
     warnings.push('Campaign has failed batches.');
   }
 
+  if (context.dispatchQueue.exists && context.dispatchQueue.row.queue_state === 'failed') {
+    warnings.push('Dispatch queue is in failed state.');
+  }
+
+  if (
+    context.input.expectedSendyCampaignId != null &&
+    context.registry &&
+    Number(context.registry.sendy_campaign_id) !== context.input.expectedSendyCampaignId
+  ) {
+    warnings.push('Registry sendy_campaign_id does not match the expected value.');
+  }
+
   if (context.registry.direct_dispatch_state === 'completed') {
     warnings.push('Campaign direct_dispatch_state is completed.');
   }
@@ -404,6 +383,17 @@ function buildVerdict(context) {
     return 'BLOCKED_RATE_TOO_HIGH';
   }
 
+  if (context.config.maxRecipientsPerRun > 250) {
+    return 'BLOCKED_MAX_RECIPIENTS_TOO_HIGH';
+  }
+
+  if (
+    context.input.expectedSendyCampaignId != null &&
+    Number(context.registry.sendy_campaign_id) !== context.input.expectedSendyCampaignId
+  ) {
+    return 'BLOCKED_SENDY_CAMPAIGN_MISMATCH';
+  }
+
   if (!context.registry.content_snapshot_id) {
     return 'BLOCKED_NO_CONTENT_SNAPSHOT';
   }
@@ -424,6 +414,10 @@ function buildVerdict(context) {
     return 'BLOCKED_ALREADY_SENT';
   }
 
+  if ((context.recipients.byState.failed || 0) > 0) {
+    return 'BLOCKED_FAILED_RECIPIENTS';
+  }
+
   if (context.registry.direct_dispatch_state === 'completed') {
     return 'BLOCKED_COMPLETED_CAMPAIGN';
   }
@@ -436,6 +430,14 @@ function buildVerdict(context) {
     return 'AMBIGUOUS_STATE';
   }
 
+  if ((context.batches.byState.failed || 0) > 0) {
+    return 'AMBIGUOUS_STATE';
+  }
+
+  if (context.dispatchQueue.exists && context.dispatchQueue.row.queue_state === 'failed') {
+    return 'AMBIGUOUS_STATE';
+  }
+
   return 'READY_FOR_DRY_RUN';
 }
 
@@ -444,11 +446,14 @@ function buildRecommendation(verdict) {
     BLOCKED_CAMPAIGN_NOT_FOUND: 'Check the dispatch campaign id in control_plane.',
     BLOCKED_ENV_NOT_DRY_RUN: 'Return .env to dry-run before continuing.',
     BLOCKED_RATE_TOO_HIGH: 'Lower maxMsgsPerSecond to 1.25 or less.',
+    BLOCKED_MAX_RECIPIENTS_TOO_HIGH: 'Lower maxRecipientsPerRun to 250 or less.',
+    BLOCKED_SENDY_CAMPAIGN_MISMATCH: 'Confirm the dispatch campaign id maps to the expected Sendy campaign.',
     BLOCKED_NO_CONTENT_SNAPSHOT: 'Run intake again or inspect missing content snapshot.',
     BLOCKED_NO_AUDIENCE_SNAPSHOT: 'Run audience resolution again or inspect missing audience snapshot.',
     BLOCKED_NO_RECIPIENTS: 'Resolve audience before preparing dispatch.',
     BLOCKED_NO_BATCHES: 'Run batch-planner before preparing dispatch.',
     BLOCKED_ALREADY_SENT: 'This campaign already sent recipients. Use a new campaign for the next test.',
+    BLOCKED_FAILED_RECIPIENTS: 'Clear or inspect failed recipients before preparing dispatch again.',
     BLOCKED_COMPLETED_CAMPAIGN: 'This campaign is already completed. Treat it as closed.',
     AMBIGUOUS_STATE: 'Inspect recipients, batches, and queue before preparing anything.',
     READY_FOR_DRY_RUN: 'Campaign looks eligible for dry-run preparation after operator review.',
@@ -475,9 +480,12 @@ function printCountSection(title, total, byState) {
 function buildPrepareDryRunPlan(context, verdict) {
   const sent = context.recipients.byState.sent || 0;
   const sending = context.recipients.byState.sending || 0;
+  const failed = context.recipients.byState.failed || 0;
   const dryRunSent = context.recipients.byState.dry_run_sent || 0;
+  const queuedBatches = context.batches.byState.queued || 0;
   const completedBatches = context.batches.byState.completed || 0;
   const runningBatches = context.batches.byState.running || 0;
+  const failedBatches = context.batches.byState.failed || 0;
 
   const blockers = [];
 
@@ -485,8 +493,44 @@ function buildPrepareDryRunPlan(context, verdict) {
     blockers.push('apply requested without --confirm-prepare-dry-run');
   }
 
-  if (verdict !== 'READY_FOR_DRY_RUN') {
-    blockers.push(`audit verdict is ${verdict}`);
+  if (!context.registry) {
+    blockers.push('campaign registry row was not found');
+  }
+
+  if (context.config.executionMode !== 'dry-run') {
+    blockers.push('environment is not in dry-run mode');
+  }
+
+  if (context.config.maxMsgsPerSecond > 1.25) {
+    blockers.push('maxMsgsPerSecond is above the safe threshold');
+  }
+
+  if (context.config.maxRecipientsPerRun > 250) {
+    blockers.push('maxRecipientsPerRun is above the early-stage threshold');
+  }
+
+  if (
+    context.input.expectedSendyCampaignId != null &&
+    context.registry &&
+    Number(context.registry.sendy_campaign_id) !== context.input.expectedSendyCampaignId
+  ) {
+    blockers.push('registry sendy_campaign_id does not match expected value');
+  }
+
+  if (context.registry && !context.registry.content_snapshot_id) {
+    blockers.push('content_snapshot_id is missing');
+  }
+
+  if (context.registry && !context.registry.audience_snapshot_id) {
+    blockers.push('audience_snapshot_id is missing');
+  }
+
+  if (context.recipients.total === 0) {
+    blockers.push('no recipients were found');
+  }
+
+  if (context.batches.total === 0) {
+    blockers.push('no batches were found');
   }
 
   if (sent > 0) {
@@ -497,16 +541,23 @@ function buildPrepareDryRunPlan(context, verdict) {
     blockers.push('campaign has recipients currently sending');
   }
 
+  if (failed > 0) {
+    blockers.push('campaign has failed recipients');
+  }
+
   if (runningBatches > 0) {
     blockers.push('campaign has running batches');
   }
 
-  if (context.registry && context.registry.direct_dispatch_state === 'completed') {
-    blockers.push('campaign is completed');
+  if (failedBatches > 0) {
+    blockers.push('campaign has failed batches');
   }
 
-  if (context.dispatchQueue.exists && context.dispatchQueue.row.queue_state === 'completed') {
-    blockers.push('dispatch queue is completed');
+  if (
+    context.dispatchQueue.exists &&
+    ['failed', 'running'].includes(context.dispatchQueue.row.queue_state)
+  ) {
+    blockers.push(`dispatch queue is ${context.dispatchQueue.row.queue_state}`);
   }
 
   if (blockers.length > 0) {
@@ -518,19 +569,117 @@ function buildPrepareDryRunPlan(context, verdict) {
     };
   }
 
-  const plannedChanges = [
-    `recipients dry_run_sent -> batched: ${dryRunSent}`,
-    `batches completed -> queued: ${completedBatches}`,
-    'registry direct_dispatch_state -> batched',
-    'dispatch queue queue_state -> queued',
-  ];
+  const plannedChanges = [];
+  plannedChanges.push(`recipients dry_run_sent -> batched: ${dryRunSent}`);
+  plannedChanges.push(`batches completed -> queued: ${completedBatches}`);
+  plannedChanges.push(`queued batches preserved: ${queuedBatches}`);
+  plannedChanges.push('registry direct_dispatch_state -> batched');
+
+  if (context.dispatchQueue.exists) {
+    plannedChanges.push('dispatch queue queue_state -> queued');
+  } else {
+    plannedChanges.push('dispatch queue row will be created');
+  }
 
   return {
     status: 'ready',
     blockers: [],
     plannedChanges,
-    note: 'Plan mode only; no DB state will be modified.',
+    note: verdict === 'READY_FOR_DRY_RUN'
+      ? 'Campaign is already ready; prepare mode can still normalize queue and registry state.'
+      : 'Plan mode only; no DB state will be modified.',
   };
+}
+
+async function applyPrepareDryRun(db, context) {
+  return db.tx(async (client) => {
+    const recipientsResetResult = await client.query(
+      `
+        UPDATE control_plane.campaign_recipient_queue
+           SET recipient_state = 'batched',
+               updated_at = now()
+         WHERE dispatch_campaign_id = $1
+           AND recipient_state = 'dry_run_sent'
+      `,
+      [context.registry.dispatch_campaign_id]
+    );
+
+    const batchesResetResult = await client.query(
+      `
+        UPDATE control_plane.campaign_delivery_batches
+           SET batch_state = 'queued',
+               started_at = NULL,
+               finished_at = NULL,
+               updated_at = now()
+         WHERE dispatch_campaign_id = $1
+           AND batch_state = 'completed'
+      `,
+      [context.registry.dispatch_campaign_id]
+    );
+
+    await client.query(
+      `
+        UPDATE control_plane.sendy_campaign_registry
+           SET direct_dispatch_state = 'batched',
+               started_at = NULL,
+               finished_at = NULL,
+               updated_at = now()
+         WHERE dispatch_campaign_id = $1
+      `,
+      [context.registry.dispatch_campaign_id]
+    );
+
+    let queueAction = 'updated';
+
+    if (context.dispatchQueue.exists) {
+      await client.query(
+        `
+          UPDATE control_plane.campaign_dispatch_queue
+             SET queue_state = 'queued',
+                 started_at = NULL,
+                 finished_at = NULL,
+                 last_error_code = NULL,
+                 last_error_message = NULL,
+                 requested_msgs_per_second = $2,
+                 updated_at = now()
+           WHERE dispatch_id = $1
+        `,
+        [
+          context.dispatchQueue.row.dispatch_id,
+          context.config.maxMsgsPerSecond,
+        ]
+      );
+    } else {
+      queueAction = 'created';
+      await client.query(
+        `
+          INSERT INTO control_plane.campaign_dispatch_queue (
+            dispatch_campaign_id,
+            tenant_id,
+            flow_type,
+            queue_state,
+            queue_priority,
+            attempt_count,
+            requested_msgs_per_second,
+            created_at,
+            updated_at
+          )
+          VALUES ($1, $2, 'broadcast', 'queued', 100, 0, $3, now(), now())
+        `,
+        [
+          context.registry.dispatch_campaign_id,
+          context.registry.tenant_id,
+          context.config.maxMsgsPerSecond,
+        ]
+      );
+    }
+
+    return {
+      recipientsReset: recipientsResetResult.rowCount,
+      batchesReset: batchesResetResult.rowCount,
+      queueAction,
+    };
+  });
 }
 
 function printPrepareDryRunPlan(plan) {
@@ -651,10 +800,7 @@ async function main() {
   const db = createControlPlaneDb(config);
 
   try {
-    const registry = args.dispatchCampaignId != null
-      ? await fetchRegistry(db, args.dispatchCampaignId)
-      : await fetchRegistryBySendyCampaignId(db, args.sendyCampaignId);
-
+    const registry = await fetchRegistry(db, args.dispatchCampaignId);
     const resolvedDispatchCampaignId = registry
       ? Number(registry.dispatch_campaign_id)
       : args.dispatchCampaignId;
@@ -701,10 +847,25 @@ async function main() {
       if (args.prepareDryRun) {
         const prepareDryRunPlan = buildPrepareDryRunPlan(context, verdict);
         printPrepareDryRunPlan(prepareDryRunPlan);
+
+        if (args.apply && prepareDryRunPlan.status === 'ready') {
+          const result = await applyPrepareDryRun(db, context);
+          console.log('');
+          console.log('Prepare dry-run apply');
+          console.log('  status: applied');
+          console.log(`  recipientsReset: ${result.recipientsReset}`);
+          console.log(`  batchesReset: ${result.batchesReset}`);
+          console.log(`  dispatchQueue: ${result.queueAction}`);
+        }
       }
     }
 
-    process.exitCode = verdict === 'READY_FOR_DRY_RUN' ? 0 : 1;
+    let exitCode = verdict === 'READY_FOR_DRY_RUN' ? 0 : 1;
+    if (args.prepareDryRun) {
+      const prepareDryRunPlan = buildPrepareDryRunPlan(context, verdict);
+      exitCode = prepareDryRunPlan.status === 'ready' ? 0 : 1;
+    }
+    process.exitCode = exitCode;
   } finally {
     if (db && typeof db.close === 'function') {
       await db.close();

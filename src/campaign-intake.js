@@ -34,6 +34,7 @@ async function loadSendyCampaign(sendyDb, sendyCampaignId) {
       links_tracking,
       web_version_lang,
       lists,
+      to_send_lists,
       lists_excl,
       segs,
       segs_excl,

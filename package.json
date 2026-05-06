@@ -9,7 +9,9 @@
     "resolve": "node src/audience-resolver.js",
     "plan-batches": "node src/batch-planner.js",
     "execute": "node src/relay-executor.js",
+    "prepare-dispatch": "node src/prepare-dispatch-run.js",
     "check:intake": "node --check src/campaign-intake.js",
+    "check:prepare": "node --check src/prepare-dispatch-run.js",
     "check:resolve": "node --check src/audience-resolver.js",
     "check:plan": "node --check src/batch-planner.js",
     "check:execute": "node --check src/relay-executor.js"
