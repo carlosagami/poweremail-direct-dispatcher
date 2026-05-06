@@ -10,6 +10,8 @@ function parseArgs(argv) {
   let audit = false;
   let json = false;
   let prepareDryRun = false;
+  let apply = false;
+  let confirmPrepareDryRun = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -26,6 +28,16 @@ function parseArgs(argv) {
 
     if (token === '--prepare-dry-run') {
       prepareDryRun = true;
+      continue;
+    }
+
+    if (token === '--apply') {
+      apply = true;
+      continue;
+    }
+
+    if (token === '--confirm-prepare-dry-run') {
+      confirmPrepareDryRun = true;
       continue;
     }
 
@@ -80,6 +92,8 @@ function parseArgs(argv) {
     audit,
     json,
     prepareDryRun,
+    apply,
+    confirmPrepareDryRun,
   };
 }
 
