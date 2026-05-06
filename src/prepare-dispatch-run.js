@@ -481,6 +481,10 @@ function buildPrepareDryRunPlan(context, verdict) {
 
   const blockers = [];
 
+  if (context.input.apply && !context.input.confirmPrepareDryRun) {
+    blockers.push('apply requested without --confirm-prepare-dry-run');
+  }
+
   if (verdict !== 'READY_FOR_DRY_RUN') {
     blockers.push(`audit verdict is ${verdict}`);
   }
