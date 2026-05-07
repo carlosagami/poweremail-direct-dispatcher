@@ -1,6 +1,6 @@
 const nodemailer = require("nodemailer");
 
-const { loadConfig } = require("./config");
+const { loadConfig, loadServiceConfig } = require("./config");
 const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
 const { chunkError } = require("./utils");
@@ -15,22 +15,29 @@ function getSendDelayMs(config) {
   return Math.ceil(1000 / Math.max(rate, 0.1));
 }
 
-async function loadBatch(cpDb, sendyCampaignId, tenantKey) {
+async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
   const { rows } = await cpDb.query(
     `
     SELECT
+      q.dispatch_id,
+      q.queue_state,
+      q.requested_msgs_per_second,
       b.delivery_batch_id,
       b.dispatch_campaign_id,
       b.batch_key,
       b.batch_size,
       b.batch_state,
       c.tenant_id,
-      c.content_snapshot_id
+      c.content_snapshot_id,
+      r.sendy_campaign_id,
+      r.tenant_key
     FROM control_plane.campaign_delivery_batches b
     JOIN control_plane.sendy_campaign_registry r
       ON r.dispatch_campaign_id = b.dispatch_campaign_id
     JOIN control_plane.campaign_content_snapshots c
       ON c.content_snapshot_id = r.content_snapshot_id
+    LEFT JOIN control_plane.campaign_dispatch_queue q
+      ON q.dispatch_campaign_id = b.dispatch_campaign_id
     WHERE r.sendy_campaign_id = $1
       AND r.tenant_key = $2
       AND b.batch_state = 'queued'
@@ -40,6 +47,107 @@ async function loadBatch(cpDb, sendyCampaignId, tenantKey) {
     [sendyCampaignId, tenantKey]
   );
   return rows[0] || null;
+}
+
+async function claimNextQueuedBatch(cpDb) {
+  return cpDb.tx(async (client) => {
+    const queueResult = await client.query(
+      `
+      SELECT
+        dispatch_id,
+        dispatch_campaign_id,
+        tenant_id,
+        queue_state,
+        requested_msgs_per_second
+      FROM control_plane.campaign_dispatch_queue
+      WHERE queue_state IN ('queued', 'reserved', 'launching', 'retry_wait', 'running')
+      ORDER BY
+        CASE queue_state
+          WHEN 'running' THEN 0
+          WHEN 'queued' THEN 1
+          WHEN 'reserved' THEN 2
+          WHEN 'launching' THEN 3
+          WHEN 'retry_wait' THEN 4
+          ELSE 9
+        END,
+        COALESCE(not_before, scheduled_for, created_at) ASC,
+        queue_priority DESC,
+        dispatch_id ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+      `
+    );
+
+    const queueRow = queueResult.rows[0];
+    if (!queueRow) {
+      return null;
+    }
+
+    const batchResult = await client.query(
+      `
+      SELECT
+        b.delivery_batch_id,
+        b.dispatch_campaign_id,
+        b.batch_key,
+        b.batch_size,
+        b.batch_state,
+        c.tenant_id,
+        c.content_snapshot_id,
+        r.sendy_campaign_id,
+        r.tenant_key,
+        $2::bigint AS dispatch_id,
+        $3::text AS queue_state,
+        $4::numeric AS requested_msgs_per_second
+      FROM control_plane.campaign_delivery_batches b
+      JOIN control_plane.sendy_campaign_registry r
+        ON r.dispatch_campaign_id = b.dispatch_campaign_id
+      JOIN control_plane.campaign_content_snapshots c
+        ON c.content_snapshot_id = r.content_snapshot_id
+      WHERE b.dispatch_campaign_id = $1
+        AND b.batch_state = 'queued'
+      ORDER BY b.delivery_batch_id ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+      `,
+      [
+        queueRow.dispatch_campaign_id,
+        queueRow.dispatch_id,
+        queueRow.queue_state,
+        queueRow.requested_msgs_per_second,
+      ]
+    );
+
+    const batch = batchResult.rows[0] || null;
+
+    if (!batch) {
+      await client.query(
+        `
+        UPDATE control_plane.campaign_dispatch_queue
+           SET queue_state = 'completed',
+               finished_at = COALESCE(finished_at, now()),
+               updated_at = now()
+         WHERE dispatch_id = $1
+        `,
+        [queueRow.dispatch_id]
+      );
+
+      await client.query(
+        `
+        UPDATE control_plane.sendy_campaign_registry
+           SET direct_dispatch_state = 'completed',
+               finished_at = COALESCE(finished_at, now()),
+               updated_at = now()
+         WHERE dispatch_campaign_id = $1
+           AND direct_dispatch_state <> 'failed'
+        `,
+        [queueRow.dispatch_campaign_id]
+      );
+
+      return null;
+    }
+
+    return batch;
+  });
 }
 
 async function loadContent(cpDb, contentSnapshotId) {
@@ -401,18 +509,34 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
 }
 
 async function main() {
-  const config = loadConfig();
+  const hasExplicitCampaign =
+    Boolean(process.env.DIRECT_DISPATCHER_TENANT_KEY) &&
+    Boolean(process.env.DIRECT_DISPATCHER_SENDY_CAMPAIGN_ID);
+
+  const config = hasExplicitCampaign ? loadConfig() : loadServiceConfig();
   const cpDb = createControlPlaneDb(config);
 
   try {
-    const batch = await loadBatch(cpDb, config.sendyCampaignId, config.tenantKey);
+    const batch = hasExplicitCampaign
+      ? await loadBatchByCampaign(cpDb, config.sendyCampaignId, config.tenantKey)
+      : await claimNextQueuedBatch(cpDb);
+
     if (!batch) {
       logger.warn("relay_executor.no_batch", {
-        sendy_campaign_id: config.sendyCampaignId,
-        tenant_key: config.tenantKey,
+        mode: hasExplicitCampaign ? "targeted" : "queue",
+        sendy_campaign_id: hasExplicitCampaign ? config.sendyCampaignId : null,
+        tenant_key: hasExplicitCampaign ? config.tenantKey : null,
       });
       return;
     }
+
+    const runConfig = {
+      ...config,
+      maxMsgsPerSecond:
+        Number(batch.requested_msgs_per_second) > 0
+          ? Number(batch.requested_msgs_per_second)
+          : Number(config.maxMsgsPerSecond),
+    };
 
     const content = await loadContent(cpDb, batch.content_snapshot_id);
     if (!content) {
@@ -423,7 +547,7 @@ async function main() {
       cpDb,
       batch.dispatch_campaign_id,
       batch.batch_key,
-      config.maxRecipientsPerRun
+      runConfig.maxRecipientsPerRun
     );
     if (recipients.length === 0) {
       throw new Error("Batch has no batched recipients");
@@ -436,7 +560,9 @@ async function main() {
       await closeDispatchIfDone(cpDb, batch);
       logger.info("relay_executor.completed", {
         execution_mode: "dry-run",
-        sendy_campaign_id: config.sendyCampaignId,
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
         batch_key: batch.batch_key,
         recipients: recipients.length,
       });
@@ -444,11 +570,13 @@ async function main() {
     }
 
     if (config.executionMode === "smtp-relay") {
-      await executeSmtpRelay(cpDb, config, batch, recipients, content);
+      await executeSmtpRelay(cpDb, runConfig, batch, recipients, content);
       await closeDispatchIfDone(cpDb, batch);
       logger.info("relay_executor.completed", {
         execution_mode: "smtp-relay",
-        sendy_campaign_id: config.sendyCampaignId,
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
         batch_key: batch.batch_key,
         recipients: recipients.length,
       });
