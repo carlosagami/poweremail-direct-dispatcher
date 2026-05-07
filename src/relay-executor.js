@@ -348,12 +348,21 @@ async function closeDispatchIfDone(cpDb, batch) {
 }
 
 async function executeDryRun(cpDb, batch, recipients) {
+  const recipientIds = recipients.map((recipient) => recipient.recipient_queue_id);
+
+  if (recipientIds.length === 0) {
+    throw new Error("Dry-run received no recipients to process");
+  }
+
+  let batchState = "unknown";
+  let remaining = 0;
+
   await cpDb.tx(async (client) => {
     await client.query(
       `
       UPDATE control_plane.campaign_delivery_batches
          SET batch_state = 'running',
-             started_at = now(),
+             started_at = COALESCE(started_at, now()),
              updated_at = now()
        WHERE delivery_batch_id = $1
       `,
@@ -365,14 +374,27 @@ async function executeDryRun(cpDb, batch, recipients) {
       UPDATE control_plane.campaign_recipient_queue
          SET recipient_state = 'dry_run_sent',
              updated_at = now()
-       WHERE dispatch_campaign_id = $1
-         AND batch_key = $2
+       WHERE recipient_queue_id = ANY($1::bigint[])
+         AND dispatch_campaign_id = $2
+         AND batch_key = $3
          AND recipient_state = 'batched'
+      `,
+      [recipientIds, batch.dispatch_campaign_id, batch.batch_key]
+    );
+
+    const remainingResult = await client.query(
+      `
+      SELECT count(*)::int AS remaining
+      FROM control_plane.campaign_recipient_queue
+      WHERE dispatch_campaign_id = $1
+        AND batch_key = $2
+        AND recipient_state = 'batched'
       `,
       [batch.dispatch_campaign_id, batch.batch_key]
     );
 
-    await finishBatchOrRequeue(client, batch);
+    remaining = remainingResult.rows[0]?.remaining || 0;
+    batchState = await finishBatchOrRequeue(client, batch);
   });
 
   await markAttempt(
@@ -381,9 +403,15 @@ async function executeDryRun(cpDb, batch, recipients) {
     batch.tenant_id,
     "dry-run",
     "ok",
-    "DRY_RUN_COMPLETED",
-    `Dry-run completed for ${recipients.length} recipients`,
-    { recipients: recipients.length }
+    batchState === "completed" ? "DRY_RUN_COMPLETED" : "DRY_RUN_PARTIAL",
+    batchState === "completed"
+      ? `Dry-run completed for ${recipients.length} recipients`
+      : `Dry-run processed ${recipients.length} recipients; ${remaining} remaining`,
+    {
+      processed: recipients.length,
+      remaining,
+      batch_state: batchState,
+    }
   );
 }
 
