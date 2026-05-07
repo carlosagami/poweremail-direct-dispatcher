@@ -417,17 +417,22 @@ async function executeDryRun(cpDb, batch, recipients) {
 
 async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
   const transporter = nodemailer.createTransport({
-    host: config.relaySmtpHost,
-    port: config.relaySmtpPort,
-    secure: config.relaySmtpSecure,
-    auth:
-      config.relaySmtpUser && config.relaySmtpPassword
-        ? {
-            user: config.relaySmtpUser,
-            pass: config.relaySmtpPassword,
-          }
-        : undefined,
-  });
+  host: config.relaySmtpHost,
+  port: config.relaySmtpPort,
+  secure: config.relaySmtpSecure,
+  auth:
+    config.relaySmtpUser && config.relaySmtpPassword
+      ? {
+          user: config.relaySmtpUser,
+          pass: config.relaySmtpPassword,
+        }
+      : undefined,
+  requireTLS: false,
+  ignoreTLS: true,
+  tls: {
+    rejectUnauthorized: false,
+  },
+});
 
   await cpDb.query(
     `
