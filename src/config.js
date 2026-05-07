@@ -27,7 +27,6 @@ function intEnv(name, fallback) {
   return parsed;
 }
 
-
 function floatEnv(name, fallback) {
   const value = process.env[name];
   if (!value) return fallback;
@@ -52,7 +51,7 @@ function requireEnv(name) {
   return value;
 }
 
-function loadConfig() {
+function loadServiceConfig() {
   loadDotEnv();
   return {
     controlPlaneDbUrl: requireEnv("CONTROL_PLANE_DATABASE_URL"),
@@ -62,8 +61,6 @@ function loadConfig() {
     sendyMysqlUser: requireEnv("SENDY_MYSQL_USER"),
     sendyMysqlPassword: requireEnv("SENDY_MYSQL_PASSWORD"),
     sendyAppPath: process.env.SENDY_APP_PATH || "",
-    tenantKey: requireEnv("DIRECT_DISPATCHER_TENANT_KEY"),
-    sendyCampaignId: intEnv("DIRECT_DISPATCHER_SENDY_CAMPAIGN_ID", 0),
     batchSize: intEnv("DIRECT_DISPATCHER_BATCH_SIZE", 250),
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
     maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
@@ -77,4 +74,12 @@ function loadConfig() {
   };
 }
 
-module.exports = { loadConfig };
+function loadConfig() {
+  return {
+    ...loadServiceConfig(),
+    tenantKey: requireEnv("DIRECT_DISPATCHER_TENANT_KEY"),
+    sendyCampaignId: intEnv("DIRECT_DISPATCHER_SENDY_CAMPAIGN_ID", 0),
+  };
+}
+
+module.exports = { loadConfig, loadServiceConfig };
