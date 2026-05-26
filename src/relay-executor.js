@@ -6,6 +6,9 @@ const logger = require("./logger");
 const { chunkError } = require("./utils");
 const { personalizeText } = require("./personalize");
 
+const BATCH_EMPTY_ERROR_CODE = "BATCH_EMPTY";
+const BATCH_EMPTY_ERROR_MESSAGE = "Batch has no batched recipients";
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -13,6 +16,10 @@ function sleep(ms) {
 function getSendDelayMs(config) {
   const rate = Number(config.maxMsgsPerSecond || 1);
   return Math.ceil(1000 / Math.max(rate, 0.1));
+}
+
+function isBatchEmptyError(err) {
+  return err?.message === BATCH_EMPTY_ERROR_MESSAGE;
 }
 
 async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
@@ -174,8 +181,8 @@ async function loadRecipients(cpDb, dispatchCampaignId, batchKey, limit) {
   return rows;
 }
 
-async function markAttempt(cpDb, batch, tenantId, executionMode, resultStatus, code, message, payload) {
-  const { rows } = await cpDb.query(
+async function markAttempt(db, batch, tenantId, executionMode, resultStatus, code, message, payload) {
+  const { rows } = await db.query(
     `
     INSERT INTO control_plane.campaign_delivery_attempts (
       delivery_batch_id,
@@ -213,6 +220,68 @@ async function markAttempt(cpDb, batch, tenantId, executionMode, resultStatus, c
     ]
   );
   return rows[0].delivery_attempt_id;
+}
+
+async function failBatchAndDispatch(cpDb, batch, executionMode, reason) {
+  await cpDb.tx(async (client) => {
+    await client.query(
+      `
+      UPDATE control_plane.campaign_delivery_batches
+         SET batch_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE delivery_batch_id = $1
+         AND batch_state IN ('queued', 'running')
+      `,
+      [batch.delivery_batch_id]
+    );
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_dispatch_queue
+         SET queue_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now(),
+             attempt_count = COALESCE(attempt_count, 0) + 1,
+             last_error_code = $2,
+             last_error_message = $3
+       WHERE dispatch_campaign_id = $1
+         AND queue_state IN ('queued', 'reserved', 'launching', 'retry_wait', 'running')
+      `,
+      [
+        batch.dispatch_campaign_id,
+        BATCH_EMPTY_ERROR_CODE,
+        BATCH_EMPTY_ERROR_MESSAGE,
+      ]
+    );
+
+    await client.query(
+      `
+      UPDATE control_plane.sendy_campaign_registry
+         SET direct_dispatch_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $1
+         AND direct_dispatch_state <> 'completed'
+      `,
+      [batch.dispatch_campaign_id]
+    );
+
+    await markAttempt(
+      client,
+      batch,
+      batch.tenant_id,
+      executionMode,
+      "error",
+      BATCH_EMPTY_ERROR_CODE,
+      BATCH_EMPTY_ERROR_MESSAGE,
+      {
+        reason,
+        batch_key: batch.batch_key,
+        batch_state: batch.batch_state,
+      }
+    );
+  });
 }
 
 async function markDispatchRunning(cpDb, batch) {
@@ -417,22 +486,22 @@ async function executeDryRun(cpDb, batch, recipients) {
 
 async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
   const transporter = nodemailer.createTransport({
-  host: config.relaySmtpHost,
-  port: config.relaySmtpPort,
-  secure: config.relaySmtpSecure,
-  auth:
-    config.relaySmtpUser && config.relaySmtpPassword
-      ? {
-          user: config.relaySmtpUser,
-          pass: config.relaySmtpPassword,
-        }
-      : undefined,
-  requireTLS: false,
-  ignoreTLS: true,
-  tls: {
-    rejectUnauthorized: false,
-  },
-});
+    host: config.relaySmtpHost,
+    port: config.relaySmtpPort,
+    secure: config.relaySmtpSecure,
+    auth:
+      config.relaySmtpUser && config.relaySmtpPassword
+        ? {
+            user: config.relaySmtpUser,
+            pass: config.relaySmtpPassword,
+          }
+        : undefined,
+    requireTLS: false,
+    ignoreTLS: true,
+    tls: {
+      rejectUnauthorized: false,
+    },
+  });
 
   await cpDb.query(
     `
@@ -546,11 +615,12 @@ async function main() {
     Boolean(process.env.DIRECT_DISPATCHER_TENANT_KEY) &&
     Boolean(process.env.DIRECT_DISPATCHER_SENDY_CAMPAIGN_ID);
 
-  const config = hasExplicitCampaign ? loadConfig() : loadServiceConfig();
+  let config = hasExplicitCampaign ? loadConfig() : loadServiceConfig();
   const cpDb = createControlPlaneDb(config);
+  let batch = null;
 
   try {
-    const batch = hasExplicitCampaign
+    batch = hasExplicitCampaign
       ? await loadBatchByCampaign(cpDb, config.sendyCampaignId, config.tenantKey)
       : await claimNextQueuedBatch(cpDb);
 
@@ -570,11 +640,7 @@ async function main() {
           ? Number(batch.requested_msgs_per_second)
           : Number(config.maxMsgsPerSecond),
     };
-
-    const content = await loadContent(cpDb, batch.content_snapshot_id);
-    if (!content) {
-      throw new Error("Content snapshot not found");
-    }
+    config = runConfig;
 
     const recipients = await loadRecipients(
       cpDb,
@@ -583,7 +649,28 @@ async function main() {
       runConfig.maxRecipientsPerRun
     );
     if (recipients.length === 0) {
-      throw new Error("Batch has no batched recipients");
+      await failBatchAndDispatch(
+        cpDb,
+        batch,
+        runConfig.executionMode,
+        "no_batched_recipients_preflight"
+      );
+
+      logger.warn("relay_executor.batch_empty_failed", {
+        execution_mode: runConfig.executionMode,
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
+        reason: "no_batched_recipients_preflight",
+      });
+      return;
+    }
+
+    const content = await loadContent(cpDb, batch.content_snapshot_id);
+    if (!content) {
+      throw new Error("Content snapshot not found");
     }
 
     await markDispatchRunning(cpDb, batch);
@@ -620,6 +707,37 @@ async function main() {
       `Unsupported DIRECT_DISPATCHER_EXECUTION_MODE=${config.executionMode}`
     );
   } catch (err) {
+    if (batch && isBatchEmptyError(err)) {
+      try {
+        await failBatchAndDispatch(
+          cpDb,
+          batch,
+          config.executionMode,
+          "no_batched_recipients_runtime"
+        );
+
+        logger.warn("relay_executor.batch_empty_failed", {
+          execution_mode: config.executionMode,
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          reason: "no_batched_recipients_runtime",
+        });
+        return;
+      } catch (reconcileErr) {
+        logger.error("relay_executor.batch_empty_reconcile_failed", {
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          error: chunkError(reconcileErr),
+          original_error: chunkError(err),
+        });
+        process.exitCode = 1;
+        return;
+      }
+    }
+
     logger.error("relay_executor.failed", { error: chunkError(err) });
     process.exitCode = 1;
   } finally {
