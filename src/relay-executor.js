@@ -8,6 +8,7 @@ const { personalizeText } = require("./personalize");
 
 const BATCH_EMPTY_ERROR_CODE = "BATCH_EMPTY";
 const BATCH_EMPTY_ERROR_MESSAGE = "Batch has no batched recipients";
+const NO_QUEUED_BATCH_ERROR_CODE = "NO_QUEUED_BATCH";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,6 +55,137 @@ async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
     [sendyCampaignId, tenantKey]
   );
   return rows[0] || null;
+}
+
+async function reconcileDispatchWithoutQueuedBatch(client, queueRow) {
+  const { rows } = await client.query(
+    `
+    SELECT
+      count(*)::int AS total_batches,
+      count(*) FILTER (WHERE batch_state = 'failed')::int AS failed_batches,
+      count(*) FILTER (WHERE batch_state IN ('reserved', 'running'))::int AS active_batches,
+      count(*) FILTER (WHERE batch_state = 'completed')::int AS completed_batches,
+      (
+        SELECT count(*)::int
+        FROM control_plane.campaign_recipient_queue
+        WHERE dispatch_campaign_id = $1
+          AND recipient_state = 'batched'
+      ) AS batched_recipients
+    FROM control_plane.campaign_delivery_batches
+    WHERE dispatch_campaign_id = $1
+    `,
+    [queueRow.dispatch_campaign_id]
+  );
+
+  const state = rows[0] || {
+    total_batches: 0,
+    failed_batches: 0,
+    active_batches: 0,
+    completed_batches: 0,
+    batched_recipients: 0,
+  };
+
+  const totalBatches = Number(state.total_batches || 0);
+  const failedBatches = Number(state.failed_batches || 0);
+  const activeBatches = Number(state.active_batches || 0);
+  const completedBatches = Number(state.completed_batches || 0);
+  const batchedRecipients = Number(state.batched_recipients || 0);
+
+  if (activeBatches > 0) {
+    return {
+      action: "defer",
+      message: "Dispatch has active batches but none are currently queued",
+      state: {
+        total_batches: totalBatches,
+        failed_batches: failedBatches,
+        active_batches: activeBatches,
+        completed_batches: completedBatches,
+        batched_recipients: batchedRecipients,
+      },
+    };
+  }
+
+  if (totalBatches === 0 || failedBatches > 0 || batchedRecipients > 0) {
+    const reason =
+      totalBatches === 0
+        ? "Dispatch queue row exists but campaign has no delivery batches"
+        : failedBatches > 0
+          ? "Dispatch queue row exists but campaign has failed batches and no queued batch"
+          : "Dispatch queue row exists but campaign still has batched recipients and no queued batch";
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_dispatch_queue
+         SET queue_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now(),
+             attempt_count = COALESCE(attempt_count, 0) + 1,
+             last_error_code = $2,
+             last_error_message = $3
+       WHERE dispatch_id = $1
+      `,
+      [queueRow.dispatch_id, NO_QUEUED_BATCH_ERROR_CODE, reason]
+    );
+
+    await client.query(
+      `
+      UPDATE control_plane.sendy_campaign_registry
+         SET direct_dispatch_state = 'failed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $1
+         AND direct_dispatch_state <> 'completed'
+      `,
+      [queueRow.dispatch_campaign_id]
+    );
+
+    return {
+      action: "failed",
+      message: reason,
+      state: {
+        total_batches: totalBatches,
+        failed_batches: failedBatches,
+        active_batches: activeBatches,
+        completed_batches: completedBatches,
+        batched_recipients: batchedRecipients,
+      },
+    };
+  }
+
+  await client.query(
+    `
+    UPDATE control_plane.campaign_dispatch_queue
+       SET queue_state = 'completed',
+           finished_at = COALESCE(finished_at, now()),
+           updated_at = now()
+     WHERE dispatch_id = $1
+    `,
+    [queueRow.dispatch_id]
+  );
+
+  await client.query(
+    `
+    UPDATE control_plane.sendy_campaign_registry
+       SET direct_dispatch_state = 'completed',
+           finished_at = COALESCE(finished_at, now()),
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+       AND direct_dispatch_state <> 'failed'
+    `,
+    [queueRow.dispatch_campaign_id]
+  );
+
+  return {
+    action: "completed",
+    message: "Dispatch has no queued batch because all batches are already complete",
+    state: {
+      total_batches: totalBatches,
+      failed_batches: failedBatches,
+      active_batches: activeBatches,
+      completed_batches: completedBatches,
+      batched_recipients: batchedRecipients,
+    },
+  };
 }
 
 async function claimNextQueuedBatch(cpDb) {
@@ -127,28 +259,19 @@ async function claimNextQueuedBatch(cpDb) {
     const batch = batchResult.rows[0] || null;
 
     if (!batch) {
-      await client.query(
-        `
-        UPDATE control_plane.campaign_dispatch_queue
-           SET queue_state = 'completed',
-               finished_at = COALESCE(finished_at, now()),
-               updated_at = now()
-         WHERE dispatch_id = $1
-        `,
-        [queueRow.dispatch_id]
+      const reconciliation = await reconcileDispatchWithoutQueuedBatch(
+        client,
+        queueRow
       );
 
-      await client.query(
-        `
-        UPDATE control_plane.sendy_campaign_registry
-           SET direct_dispatch_state = 'completed',
-               finished_at = COALESCE(finished_at, now()),
-               updated_at = now()
-         WHERE dispatch_campaign_id = $1
-           AND direct_dispatch_state <> 'failed'
-        `,
-        [queueRow.dispatch_campaign_id]
-      );
+      logger.warn("relay_executor.queue_without_queued_batch", {
+        dispatch_campaign_id: queueRow.dispatch_campaign_id,
+        dispatch_id: queueRow.dispatch_id,
+        queue_state: queueRow.queue_state,
+        action: reconciliation.action,
+        reason: reconciliation.message,
+        ...reconciliation.state,
+      });
 
       return null;
     }
