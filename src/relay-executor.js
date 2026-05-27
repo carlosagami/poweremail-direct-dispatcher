@@ -13,10 +13,37 @@ const SMTP_RELAY_STARTED_CODE = "SMTP_RELAY_STARTED";
 const SMTP_RELAY_PROGRESS_CODE = "SMTP_RELAY_PROGRESS";
 const SMTP_RELAY_PARTIAL_CODE = "SMTP_RELAY_PARTIAL";
 const STALE_BATCH_REQUEUED_CODE = "STALE_BATCH_REQUEUED";
+const WORKER_SHUTDOWN_CODE = "WORKER_SHUTDOWN";
+
+let shutdownRequested = false;
+let shutdownSignal = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+function requestShutdown(signal) {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  shutdownSignal = signal;
+  logger.warn("relay_executor.shutdown_requested", { signal });
+}
+
+function isShutdownRequestedError(err) {
+  return err?.code === WORKER_SHUTDOWN_CODE;
+}
+
+function throwIfShutdownRequested() {
+  if (!shutdownRequested) return;
+  const err = new Error(
+    `Shutdown requested via ${shutdownSignal || "signal"}`
+  );
+  err.code = WORKER_SHUTDOWN_CODE;
+  throw err;
+}
+
+process.on("SIGTERM", () => requestShutdown("SIGTERM"));
+process.on("SIGINT", () => requestShutdown("SIGINT"));
 
 function getSendDelayMs(config) {
   const rate = Number(config.maxMsgsPerSecond || 1);
@@ -538,6 +565,31 @@ async function recordSmtpRelayProgress(db, batch, deliveryAttemptId, sentCount, 
   await touchBatchProgress(db, batch);
 }
 
+async function requeueBatchForShutdown(db, batch) {
+  await db.query(
+    `
+    UPDATE control_plane.campaign_delivery_batches
+       SET batch_state = 'queued',
+           started_at = NULL,
+           updated_at = now()
+     WHERE delivery_batch_id = $1
+    `,
+    [batch.delivery_batch_id]
+  );
+
+  await db.query(
+    `
+    UPDATE control_plane.campaign_recipient_queue
+       SET recipient_state = 'batched',
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+       AND batch_key = $2
+       AND recipient_state = 'sending'
+    `,
+    [batch.dispatch_campaign_id, batch.batch_key]
+  );
+}
+
 async function failBatchAndDispatch(cpDb, batch, executionMode, reason) {
   await cpDb.tx(async (client) => {
     await client.query(
@@ -860,7 +912,11 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
   });
 
   try {
+    throwIfShutdownRequested();
+
     for (const recipient of recipients) {
+      throwIfShutdownRequested();
+
       await cpDb.query(
         `
         UPDATE control_plane.campaign_recipient_queue
@@ -962,6 +1018,40 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       batch_state: batchState,
     });
   } catch (err) {
+    if (isShutdownRequestedError(err)) {
+      await requeueBatchForShutdown(cpDb, batch);
+      await updateAttempt(
+        cpDb,
+        deliveryAttemptId,
+        "warn",
+        WORKER_SHUTDOWN_CODE,
+        `smtp-relay interrupted by ${shutdownSignal || "signal"} after sending ${sentCount} recipients`,
+        {
+          planned: plannedCount,
+          sent: sentCount,
+          remaining: Math.max(plannedCount - sentCount, 0),
+          batch_state: "queued",
+          interrupted: true,
+          signal: shutdownSignal,
+          batch_key: batch.batch_key,
+          batch_size: batch.batch_size,
+        }
+      );
+
+      logger.warn("relay_executor.batch_interrupted", {
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
+        delivery_attempt_id: deliveryAttemptId,
+        sent_before_shutdown: sentCount,
+        planned: plannedCount,
+        signal: shutdownSignal,
+      });
+      return;
+    }
+
     await cpDb.query(
       `
       UPDATE control_plane.campaign_delivery_batches
