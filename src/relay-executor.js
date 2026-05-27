@@ -203,12 +203,8 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
           b.delivery_batch_id,
           b.dispatch_campaign_id,
           b.batch_key,
-          b.batch_size,
-          r.sendy_campaign_id,
-          r.tenant_key
+          b.batch_size
         FROM control_plane.campaign_delivery_batches b
-        LEFT JOIN control_plane.sendy_campaign_registry r
-          ON r.dispatch_campaign_id = b.dispatch_campaign_id
         WHERE b.batch_state = 'running'
           AND b.updated_at < now() - ($1::bigint * interval '1 millisecond')
         FOR UPDATE SKIP LOCKED
@@ -224,9 +220,7 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
           sb.delivery_batch_id,
           sb.dispatch_campaign_id,
           sb.batch_key,
-          sb.batch_size,
-          sb.sendy_campaign_id,
-          sb.tenant_key
+          sb.batch_size
       ),
       reset_recipients AS (
         UPDATE control_plane.campaign_recipient_queue r
@@ -243,10 +237,12 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
         rb.dispatch_campaign_id,
         rb.batch_key,
         rb.batch_size,
-        rb.sendy_campaign_id,
-        rb.tenant_key,
+        r.sendy_campaign_id,
+        r.tenant_key,
         count(rr.recipient_queue_id)::int AS reset_sending_recipients
       FROM requeued_batches rb
+      LEFT JOIN control_plane.sendy_campaign_registry r
+        ON r.dispatch_campaign_id = rb.dispatch_campaign_id
       LEFT JOIN reset_recipients rr
         ON rr.dispatch_campaign_id = rb.dispatch_campaign_id
        AND rr.batch_key = rb.batch_key
@@ -255,8 +251,8 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
         rb.dispatch_campaign_id,
         rb.batch_key,
         rb.batch_size,
-        rb.sendy_campaign_id,
-        rb.tenant_key
+        r.sendy_campaign_id,
+        r.tenant_key
       ORDER BY rb.delivery_batch_id ASC
       `,
       [timeoutMs]
