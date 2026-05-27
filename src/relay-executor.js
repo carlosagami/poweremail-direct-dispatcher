@@ -193,15 +193,21 @@ async function claimNextQueuedBatch(cpDb) {
     const queueResult = await client.query(
       `
       SELECT
-        dispatch_id,
-        dispatch_campaign_id,
-        tenant_id,
-        queue_state,
-        requested_msgs_per_second
-      FROM control_plane.campaign_dispatch_queue
-      WHERE queue_state IN ('queued', 'reserved', 'launching', 'retry_wait', 'running')
+        q.dispatch_id,
+        q.dispatch_campaign_id,
+        q.tenant_id,
+        q.queue_state,
+        q.requested_msgs_per_second
+      FROM control_plane.campaign_dispatch_queue q
+      WHERE q.queue_state IN ('queued', 'reserved', 'launching', 'retry_wait', 'running')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM control_plane.campaign_delivery_batches active_batches
+          WHERE active_batches.dispatch_campaign_id = q.dispatch_campaign_id
+            AND active_batches.batch_state IN ('reserved', 'running')
+        )
       ORDER BY
-        CASE queue_state
+        CASE q.queue_state
           WHEN 'running' THEN 0
           WHEN 'queued' THEN 1
           WHEN 'reserved' THEN 2
@@ -209,9 +215,9 @@ async function claimNextQueuedBatch(cpDb) {
           WHEN 'retry_wait' THEN 4
           ELSE 9
         END,
-        COALESCE(not_before, scheduled_for, created_at) ASC,
-        queue_priority DESC,
-        dispatch_id ASC
+        COALESCE(q.not_before, q.scheduled_for, q.created_at) ASC,
+        q.queue_priority DESC,
+        q.dispatch_id ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
       `
@@ -235,8 +241,8 @@ async function claimNextQueuedBatch(cpDb) {
         r.sendy_campaign_id,
         r.tenant_key,
         $2::bigint AS dispatch_id,
-        $3::text AS queue_state,
-        $4::numeric AS requested_msgs_per_second
+        'running'::text AS queue_state,
+        $3::numeric AS requested_msgs_per_second
       FROM control_plane.campaign_delivery_batches b
       JOIN control_plane.sendy_campaign_registry r
         ON r.dispatch_campaign_id = b.dispatch_campaign_id
@@ -251,7 +257,6 @@ async function claimNextQueuedBatch(cpDb) {
       [
         queueRow.dispatch_campaign_id,
         queueRow.dispatch_id,
-        queueRow.queue_state,
         queueRow.requested_msgs_per_second,
       ]
     );
@@ -275,6 +280,28 @@ async function claimNextQueuedBatch(cpDb) {
 
       return null;
     }
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_delivery_batches
+         SET batch_state = 'running',
+             started_at = COALESCE(started_at, now()),
+             updated_at = now()
+       WHERE delivery_batch_id = $1
+      `,
+      [batch.delivery_batch_id]
+    );
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_dispatch_queue
+         SET queue_state = 'running',
+             started_at = COALESCE(started_at, now()),
+             updated_at = now()
+       WHERE dispatch_id = $1
+      `,
+      [queueRow.dispatch_id]
+    );
 
     return batch;
   });
@@ -630,7 +657,7 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
     `
     UPDATE control_plane.campaign_delivery_batches
        SET batch_state = 'running',
-           started_at = now(),
+           started_at = COALESCE(started_at, now()),
            updated_at = now()
      WHERE delivery_batch_id = $1
     `,
