@@ -65,6 +65,10 @@ function loadServiceConfig() {
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
     maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
     maxRecipientsPerRun: intEnv("DIRECT_DISPATCHER_MAX_RECIPIENTS_PER_RUN", 25),
+    staleBatchTimeoutMs: intEnv(
+      "DIRECT_DISPATCHER_STALE_BATCH_TIMEOUT_MS",
+      5 * 60 * 1000
+    ),
     relaySmtpHost: process.env.RELAY_SMTP_HOST || "",
     relaySmtpPort: intEnv("RELAY_SMTP_PORT", 587),
     relaySmtpSecure: boolEnv("RELAY_SMTP_SECURE", false),
