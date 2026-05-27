@@ -9,6 +9,9 @@ const { personalizeText } = require("./personalize");
 const BATCH_EMPTY_ERROR_CODE = "BATCH_EMPTY";
 const BATCH_EMPTY_ERROR_MESSAGE = "Batch has no batched recipients";
 const NO_QUEUED_BATCH_ERROR_CODE = "NO_QUEUED_BATCH";
+const SMTP_RELAY_STARTED_CODE = "SMTP_RELAY_STARTED";
+const SMTP_RELAY_PROGRESS_CODE = "SMTP_RELAY_PROGRESS";
+const SMTP_RELAY_PARTIAL_CODE = "SMTP_RELAY_PARTIAL";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -372,6 +375,55 @@ async function markAttempt(db, batch, tenantId, executionMode, resultStatus, cod
   return rows[0].delivery_attempt_id;
 }
 
+async function updateAttempt(db, deliveryAttemptId, resultStatus, code, message, payload) {
+  await db.query(
+    `
+    UPDATE control_plane.campaign_delivery_attempts
+       SET result_status = $2,
+           result_code = $3,
+           result_message = $4,
+           payload_json = $5::jsonb
+     WHERE delivery_attempt_id = $1
+    `,
+    [
+      deliveryAttemptId,
+      resultStatus,
+      code || null,
+      message || null,
+      JSON.stringify(payload || {}),
+    ]
+  );
+}
+
+async function touchBatchProgress(db, batch) {
+  await db.query(
+    `
+    UPDATE control_plane.campaign_delivery_batches
+       SET updated_at = now()
+     WHERE delivery_batch_id = $1
+    `,
+    [batch.delivery_batch_id]
+  );
+}
+
+async function recordSmtpRelayProgress(db, batch, deliveryAttemptId, sentCount, plannedCount) {
+  await updateAttempt(
+    db,
+    deliveryAttemptId,
+    "warn",
+    SMTP_RELAY_PROGRESS_CODE,
+    `smtp-relay sent ${sentCount} of ${plannedCount} recipients`,
+    {
+      planned: plannedCount,
+      sent: sentCount,
+      remaining: Math.max(plannedCount - sentCount, 0),
+      batch_key: batch.batch_key,
+      batch_size: batch.batch_size,
+    }
+  );
+  await touchBatchProgress(db, batch);
+}
+
 async function failBatchAndDispatch(cpDb, batch, executionMode, reason) {
   await cpDb.tx(async (client) => {
     await client.query(
@@ -665,6 +717,34 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
   );
 
   let sentCount = 0;
+  const plannedCount = recipients.length;
+  const deliveryAttemptId = await markAttempt(
+    cpDb,
+    batch,
+    batch.tenant_id,
+    "smtp-relay",
+    "warn",
+    SMTP_RELAY_STARTED_CODE,
+    `smtp-relay started for up to ${plannedCount} recipients`,
+    {
+      planned: plannedCount,
+      sent: 0,
+      remaining: plannedCount,
+      batch_key: batch.batch_key,
+      batch_size: batch.batch_size,
+    }
+  );
+
+  logger.info("relay_executor.batch_started", {
+    sendy_campaign_id: batch.sendy_campaign_id,
+    tenant_key: batch.tenant_key,
+    dispatch_campaign_id: batch.dispatch_campaign_id,
+    batch_key: batch.batch_key,
+    delivery_batch_id: batch.delivery_batch_id,
+    delivery_attempt_id: deliveryAttemptId,
+    planned_recipients: plannedCount,
+  });
+
   try {
     for (const recipient of recipients) {
       await cpDb.query(
@@ -705,21 +785,68 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         [recipient.recipient_queue_id]
       );
 
+      await recordSmtpRelayProgress(
+        cpDb,
+        batch,
+        deliveryAttemptId,
+        sentCount,
+        plannedCount
+      );
+
+      if (
+        sentCount === 1 ||
+        sentCount === plannedCount ||
+        sentCount % 25 === 0
+      ) {
+        logger.info("relay_executor.batch_progress", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          delivery_attempt_id: deliveryAttemptId,
+          sent: sentCount,
+          planned: plannedCount,
+        });
+      }
+
       await sleep(getSendDelayMs(config));
     }
 
-    await finishBatchOrRequeue(cpDb, batch);
+    const batchState = await finishBatchOrRequeue(cpDb, batch);
+    const remaining = Math.max(plannedCount - sentCount, 0);
 
-    await markAttempt(
+    await updateAttempt(
       cpDb,
-      batch,
-      batch.tenant_id,
-      "smtp-relay",
-      "ok",
-      "SMTP_RELAY_COMPLETED",
-      `smtp-relay completed for ${sentCount} recipients`,
-      { sent: sentCount }
+      deliveryAttemptId,
+      batchState === "completed" ? "ok" : "warn",
+      batchState === "completed"
+        ? "SMTP_RELAY_COMPLETED"
+        : SMTP_RELAY_PARTIAL_CODE,
+      batchState === "completed"
+        ? `smtp-relay completed for ${sentCount} recipients`
+        : `smtp-relay partially completed ${sentCount} recipients; ${remaining} remaining`,
+      {
+        planned: plannedCount,
+        sent: sentCount,
+        remaining,
+        batch_state: batchState,
+        batch_key: batch.batch_key,
+        batch_size: batch.batch_size,
+      }
     );
+
+    logger.info("relay_executor.batch_completed", {
+      sendy_campaign_id: batch.sendy_campaign_id,
+      tenant_key: batch.tenant_key,
+      dispatch_campaign_id: batch.dispatch_campaign_id,
+      batch_key: batch.batch_key,
+      delivery_batch_id: batch.delivery_batch_id,
+      delivery_attempt_id: deliveryAttemptId,
+      sent: sentCount,
+      planned: plannedCount,
+      batch_state: batchState,
+    });
   } catch (err) {
     await cpDb.query(
       `
@@ -746,16 +873,31 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       [batch.dispatch_campaign_id, batch.batch_key, err.message]
     );
 
-    await markAttempt(
+    await updateAttempt(
       cpDb,
-      batch,
-      batch.tenant_id,
-      "smtp-relay",
+      deliveryAttemptId,
       "error",
       "SMTP_RELAY_ERROR",
       err.message,
-      { sent_before_failure: sentCount }
+      {
+        planned: plannedCount,
+        sent_before_failure: sentCount,
+        remaining: Math.max(plannedCount - sentCount, 0),
+        batch_key: batch.batch_key,
+        batch_size: batch.batch_size,
+      }
     );
+
+    logger.error("relay_executor.batch_failed", {
+      sendy_campaign_id: batch.sendy_campaign_id,
+      tenant_key: batch.tenant_key,
+      dispatch_campaign_id: batch.dispatch_campaign_id,
+      batch_key: batch.batch_key,
+      delivery_batch_id: batch.delivery_batch_id,
+      delivery_attempt_id: deliveryAttemptId,
+      sent_before_failure: sentCount,
+      error: chunkError(err),
+    });
     throw err;
   }
 }
