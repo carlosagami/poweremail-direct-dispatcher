@@ -9,11 +9,96 @@ const workerConcurrency = Math.max(
   Number.parseInt(process.env.DIRECT_DISPATCHER_WORKER_CONCURRENCY || '1', 10),
   1
 );
+const shutdownGraceMs = Math.max(
+  Number.parseInt(process.env.DIRECT_DISPATCHER_SHUTDOWN_GRACE_MS || '15000', 10),
+  1000
+);
 
 let activeWorkers = 0;
+let shutdownRequested = false;
+let shutdownSignal = null;
+let shutdownTimer = null;
+let initialTopUpTimer = null;
+let intervalHandle = null;
+const activeChildren = new Set();
+
+function exitIfShutdownDrained() {
+  if (!shutdownRequested || activeWorkers > 0) return;
+
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+
+  logger.info('worker_loop.shutdown_complete', {
+    signal: shutdownSignal,
+    activeWorkers,
+  });
+  process.exit(0);
+}
+
+function requestShutdown(signal) {
+  if (shutdownRequested) return;
+
+  shutdownRequested = true;
+  shutdownSignal = signal;
+
+  if (initialTopUpTimer) clearTimeout(initialTopUpTimer);
+  if (intervalHandle) clearInterval(intervalHandle);
+
+  logger.warn('worker_loop.shutdown_requested', {
+    signal,
+    activeWorkers,
+    workerConcurrency,
+    shutdownGraceMs,
+  });
+
+  for (const child of activeChildren) {
+    try {
+      child.kill(signal);
+    } catch (error) {
+      logger.warn('worker_loop.child_signal_failed', {
+        signal,
+        pid: child.pid,
+        error: {
+          name: error.name,
+          message: error.message,
+        },
+      });
+    }
+  }
+
+  shutdownTimer = setTimeout(() => {
+    logger.warn('worker_loop.shutdown_force_kill', {
+      signal: shutdownSignal,
+      activeWorkers,
+    });
+
+    for (const child of activeChildren) {
+      try {
+        child.kill('SIGKILL');
+      } catch (error) {
+        logger.warn('worker_loop.child_kill_failed', {
+          pid: child.pid,
+          error: {
+            name: error.name,
+            message: error.message,
+          },
+        });
+      }
+    }
+
+    process.exit(0);
+  }, shutdownGraceMs);
+
+  exitIfShutdownDrained();
+}
+
+process.on('SIGTERM', () => requestShutdown('SIGTERM'));
+process.on('SIGINT', () => requestShutdown('SIGINT'));
 
 function runExecutorOnce() {
-  if (!enabled) return false;
+  if (!enabled || shutdownRequested) return false;
 
   if (activeWorkers >= workerConcurrency) {
     logger.info('worker_loop.skip_at_capacity', {
@@ -30,6 +115,7 @@ function runExecutorOnce() {
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  activeChildren.add(child);
 
   let stdout = '';
   let stderr = '';
@@ -43,6 +129,7 @@ function runExecutorOnce() {
   });
 
   child.on('error', (error) => {
+    activeChildren.delete(child);
     activeWorkers = Math.max(activeWorkers - 1, 0);
     logger.error('worker_loop.spawn_failed', {
       error: {
@@ -51,13 +138,16 @@ function runExecutorOnce() {
         stack: error.stack,
       },
     });
+    exitIfShutdownDrained();
   });
 
-  child.on('close', (code) => {
+  child.on('close', (code, signal) => {
+    activeChildren.delete(child);
     activeWorkers = Math.max(activeWorkers - 1, 0);
 
     const payload = {
       code,
+      signal: signal || null,
       stdout: stdout.trim(),
       stderr: stderr.trim(),
       activeWorkers,
@@ -69,13 +159,15 @@ function runExecutorOnce() {
     } else {
       logger.error('worker_loop.executor_failed', payload);
     }
+
+    exitIfShutdownDrained();
   });
 
   return true;
 }
 
 function topUpWorkers() {
-  if (!enabled) return;
+  if (!enabled || shutdownRequested) return;
 
   while (activeWorkers < workerConcurrency) {
     const spawned = runExecutorOnce();
@@ -84,10 +176,10 @@ function topUpWorkers() {
 }
 
 if (enabled) {
-  logger.info('worker_loop.started', { intervalMs, workerConcurrency });
+  logger.info('worker_loop.started', { intervalMs, workerConcurrency, shutdownGraceMs });
 
-  setTimeout(topUpWorkers, 5000);
-  setInterval(topUpWorkers, intervalMs);
+  initialTopUpTimer = setTimeout(topUpWorkers, 5000);
+  intervalHandle = setInterval(topUpWorkers, intervalMs);
 } else {
   logger.info('worker_loop.disabled');
 }
