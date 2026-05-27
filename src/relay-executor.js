@@ -12,6 +12,7 @@ const NO_QUEUED_BATCH_ERROR_CODE = "NO_QUEUED_BATCH";
 const SMTP_RELAY_STARTED_CODE = "SMTP_RELAY_STARTED";
 const SMTP_RELAY_PROGRESS_CODE = "SMTP_RELAY_PROGRESS";
 const SMTP_RELAY_PARTIAL_CODE = "SMTP_RELAY_PARTIAL";
+const STALE_BATCH_REQUEUED_CODE = "STALE_BATCH_REQUEUED";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -191,7 +192,124 @@ async function reconcileDispatchWithoutQueuedBatch(client, queueRow) {
   };
 }
 
-async function claimNextQueuedBatch(cpDb) {
+async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
+  const timeoutMs = Math.max(Number(staleBatchTimeoutMs || 0), 60 * 1000);
+
+  return cpDb.tx(async (client) => {
+    const { rows } = await client.query(
+      `
+      WITH stale_batches AS (
+        SELECT
+          b.delivery_batch_id,
+          b.dispatch_campaign_id,
+          b.batch_key,
+          b.batch_size,
+          r.sendy_campaign_id,
+          r.tenant_key
+        FROM control_plane.campaign_delivery_batches b
+        LEFT JOIN control_plane.sendy_campaign_registry r
+          ON r.dispatch_campaign_id = b.dispatch_campaign_id
+        WHERE b.batch_state = 'running'
+          AND b.updated_at < now() - ($1::bigint * interval '1 millisecond')
+        FOR UPDATE SKIP LOCKED
+      ),
+      requeued_batches AS (
+        UPDATE control_plane.campaign_delivery_batches b
+           SET batch_state = 'queued',
+               started_at = NULL,
+               updated_at = now()
+          FROM stale_batches sb
+         WHERE b.delivery_batch_id = sb.delivery_batch_id
+        RETURNING
+          sb.delivery_batch_id,
+          sb.dispatch_campaign_id,
+          sb.batch_key,
+          sb.batch_size,
+          sb.sendy_campaign_id,
+          sb.tenant_key
+      ),
+      reset_recipients AS (
+        UPDATE control_plane.campaign_recipient_queue r
+           SET recipient_state = 'batched',
+               updated_at = now()
+          FROM requeued_batches rb
+         WHERE r.dispatch_campaign_id = rb.dispatch_campaign_id
+           AND r.batch_key = rb.batch_key
+           AND r.recipient_state = 'sending'
+        RETURNING r.recipient_queue_id, r.dispatch_campaign_id, r.batch_key
+      )
+      SELECT
+        rb.delivery_batch_id,
+        rb.dispatch_campaign_id,
+        rb.batch_key,
+        rb.batch_size,
+        rb.sendy_campaign_id,
+        rb.tenant_key,
+        count(rr.recipient_queue_id)::int AS reset_sending_recipients
+      FROM requeued_batches rb
+      LEFT JOIN reset_recipients rr
+        ON rr.dispatch_campaign_id = rb.dispatch_campaign_id
+       AND rr.batch_key = rb.batch_key
+      GROUP BY
+        rb.delivery_batch_id,
+        rb.dispatch_campaign_id,
+        rb.batch_key,
+        rb.batch_size,
+        rb.sendy_campaign_id,
+        rb.tenant_key
+      ORDER BY rb.delivery_batch_id ASC
+      `,
+      [timeoutMs]
+    );
+
+    if (rows.length === 0) {
+      return [];
+    }
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_delivery_attempts
+         SET result_status = 'warn',
+             result_code = $2,
+             result_message = $3,
+             payload_json = COALESCE(payload_json, '{}'::jsonb) || jsonb_build_object(
+               'recovered_stale_batch', true,
+               'stale_timeout_ms', $1::bigint
+             )
+       WHERE delivery_batch_id = ANY($4::bigint[])
+         AND result_status = 'warn'
+         AND result_code IN ($5, $6)
+      `,
+      [
+        timeoutMs,
+        STALE_BATCH_REQUEUED_CODE,
+        'Batch automatically requeued after stale heartbeat timeout',
+        rows.map((row) => row.delivery_batch_id),
+        SMTP_RELAY_STARTED_CODE,
+        SMTP_RELAY_PROGRESS_CODE,
+      ]
+    );
+
+    for (const row of rows) {
+      logger.warn("relay_executor.batch_requeued_stale", {
+        sendy_campaign_id: row.sendy_campaign_id,
+        tenant_key: row.tenant_key,
+        dispatch_campaign_id: row.dispatch_campaign_id,
+        batch_key: row.batch_key,
+        delivery_batch_id: row.delivery_batch_id,
+        batch_size: row.batch_size,
+        reset_sending_recipients: row.reset_sending_recipients,
+        stale_timeout_ms: timeoutMs,
+      });
+    }
+
+    return rows;
+  });
+}
+
+async function claimNextQueuedBatch(cpDb, staleBatchTimeoutMs) {
+  await recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs);
+
   return cpDb.tx(async (client) => {
     const queueResult = await client.query(
       `
@@ -914,7 +1032,7 @@ async function main() {
   try {
     batch = hasExplicitCampaign
       ? await loadBatchByCampaign(cpDb, config.sendyCampaignId, config.tenantKey)
-      : await claimNextQueuedBatch(cpDb);
+      : await claimNextQueuedBatch(cpDb, config.staleBatchTimeoutMs);
 
     if (!batch) {
       logger.warn("relay_executor.no_batch", {
