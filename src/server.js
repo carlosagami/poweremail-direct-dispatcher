@@ -113,6 +113,250 @@ async function findTenant(client, tenantKey) {
   return result.rows[0];
 }
 
+
+async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
+  const emails = Array.from(
+    new Set(
+      recipients
+        .map((recipient) => String(recipient.email || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+
+  if (emails.length === 0) return [];
+
+  const result = await client.query(
+    `
+    WITH matched_overrides AS (
+      SELECT
+        o.email_norm,
+        o.pinned_from_email,
+        split_part(o.pinned_from_email, '@', 1) AS localpart,
+        split_part(o.pinned_from_email, '@', 2) AS pinned_domain
+      FROM control_plane.tenant_test_lead_alias_overrides o
+      WHERE o.tenant_id = $1
+        AND o.enabled = true
+        AND o.email_norm = ANY($2::text[])
+    ),
+    pinned_domains AS (
+      SELECT
+        mo.*,
+        td.role,
+        row_number() OVER (
+          PARTITION BY td.tenant_id, td.role
+          ORDER BY td.tenant_domain_id
+        ) AS role_rank
+      FROM matched_overrides mo
+      JOIN control_plane.tenant_domains td
+        ON td.tenant_id = $1
+       AND td.domain = mo.pinned_domain
+       AND td.is_enabled = true
+      WHERE td.role IN ('primary', 'standby')
+    ),
+    reserves AS (
+      SELECT
+        td.domain,
+        row_number() OVER (
+          PARTITION BY td.tenant_id
+          ORDER BY td.tenant_domain_id
+        ) AS reserve_rank
+      FROM control_plane.tenant_domains td
+      WHERE td.tenant_id = $1
+        AND td.role = 'reserve'
+        AND td.is_enabled = true
+    ),
+    mirrors AS (
+      SELECT
+        pd.email_norm,
+        pd.pinned_from_email,
+        pd.localpart,
+        pd.pinned_domain,
+        pd.role,
+        CASE
+          WHEN pd.role = 'primary' THEN 1
+          WHEN pd.role = 'standby' THEN 2
+          ELSE NULL
+        END AS target_reserve_rank
+      FROM pinned_domains pd
+    )
+    SELECT
+      m.email_norm,
+      m.pinned_from_email,
+      m.role,
+      r.domain AS reserve_domain,
+      m.localpart || '@' || r.domain AS mirror_from_email,
+      m.localpart || '@mail.' || r.domain AS mirror_reply_to
+    FROM mirrors m
+    JOIN reserves r
+      ON r.reserve_rank = m.target_reserve_rank
+    JOIN control_plane.tenant_aliases a
+      ON a.tenant_id = $1
+     AND a.from_email = m.localpart || '@' || r.domain
+     AND a.enabled = true
+    ORDER BY r.reserve_rank, m.email_norm
+    `,
+    [tenantId, emails]
+  );
+
+  const recipientsByEmail = new Map(
+    recipients.map((recipient) => [
+      String(recipient.email || "").trim().toLowerCase(),
+      recipient,
+    ])
+  );
+
+  const groups = new Map();
+
+  for (const row of result.rows) {
+    const recipient = recipientsByEmail.get(row.email_norm);
+    if (!recipient) continue;
+
+    const key = row.mirror_from_email;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        fromEmail: row.mirror_from_email,
+        replyTo: row.mirror_reply_to,
+        reserveDomain: row.reserve_domain,
+        sourceRole: row.role,
+        recipients: [],
+      });
+    }
+
+    groups.get(key).recipients.push(recipient);
+  }
+
+  return Array.from(groups.values());
+}
+
+function buildMirrorCampaign(campaign, mirrorGroup, parentDispatchCampaignId) {
+  return {
+    ...campaign,
+    from_email: mirrorGroup.fromEmail,
+    fromEmail: mirrorGroup.fromEmail,
+    reply_to: mirrorGroup.replyTo,
+    replyTo: mirrorGroup.replyTo,
+    source_json: {
+      ...(campaign.source_json || {}),
+      test_reserve_mirror: true,
+      parent_dispatch_campaign_id: parentDispatchCampaignId,
+      reserve_domain: mirrorGroup.reserveDomain,
+      source_role: mirrorGroup.sourceRole,
+    },
+  };
+}
+
+async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGroup, index) {
+  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}`;
+
+  const existing = await client.query(
+    `
+    SELECT dispatch_campaign_id, tenant_id, tenant_key, sendy_campaign_id, direct_dispatch_state
+    FROM control_plane.sendy_campaign_registry
+    WHERE tenant_key = $1
+      AND source_system = 'poweremail-test-reserve-mirror'
+      AND source_object_id = $2
+    ORDER BY dispatch_campaign_id DESC
+    LIMIT 1
+    `,
+    [tenant.tenant_key, sourceObjectId]
+  );
+
+  if (existing.rows[0]) {
+    if (existing.rows[0].direct_dispatch_state === "completed") {
+      throw httpError(409, `Mirror dispatch already completed for ${sourceObjectId}`);
+    }
+
+    await client.query(
+      `
+      UPDATE control_plane.sendy_campaign_registry
+         SET from_email = $2,
+             reply_to = $3,
+             direct_dispatch_state = CASE
+               WHEN direct_dispatch_state = 'completed' THEN direct_dispatch_state
+               ELSE 'pending'
+             END,
+             sendy_snapshot_json = COALESCE(sendy_snapshot_json, '{}'::jsonb) || jsonb_build_object(
+               'test_reserve_mirror', true,
+               'parent_dispatch_campaign_id', $1::bigint,
+               'reserve_domain', $4,
+               'source_role', $5
+             ),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $6
+      `,
+      [
+        originalRegistry.dispatch_campaign_id,
+        mirrorGroup.fromEmail,
+        mirrorGroup.replyTo,
+        mirrorGroup.reserveDomain,
+        mirrorGroup.sourceRole,
+        existing.rows[0].dispatch_campaign_id,
+      ]
+    );
+
+    return existing.rows[0];
+  }
+
+  const insert = await client.query(
+    `
+    INSERT INTO control_plane.sendy_campaign_registry (
+      tenant_id,
+      tenant_key,
+      flow_type,
+      source_system,
+      source_object_id,
+      sendy_campaign_id,
+      sendy_campaign_name,
+      subject,
+      from_email,
+      reply_to,
+      campaign_state,
+      approved_at,
+      approved_by,
+      sendy_snapshot_json,
+      direct_dispatch_enabled,
+      direct_dispatch_state
+    )
+    SELECT
+      tenant_id,
+      tenant_key,
+      flow_type,
+      'poweremail-test-reserve-mirror',
+      $2,
+      (($1::bigint * -10) - $3::bigint),
+      sendy_campaign_name || ' [reserve mirror ' || $3::text || ']',
+      subject,
+      $4,
+      $5,
+      campaign_state,
+      now(),
+      'poweremail-mirror-dispatch',
+      sendy_snapshot_json || jsonb_build_object(
+        'test_reserve_mirror', true,
+        'parent_dispatch_campaign_id', dispatch_campaign_id,
+        'reserve_domain', $6,
+        'source_role', $7
+      ),
+      true,
+      'pending'
+    FROM control_plane.sendy_campaign_registry
+    WHERE dispatch_campaign_id = $1
+    RETURNING dispatch_campaign_id, tenant_id, tenant_key, sendy_campaign_id, direct_dispatch_state
+    `,
+    [
+      originalRegistry.dispatch_campaign_id,
+      sourceObjectId,
+      index,
+      mirrorGroup.fromEmail,
+      mirrorGroup.replyTo,
+      mirrorGroup.reserveDomain,
+      mirrorGroup.sourceRole,
+    ]
+  );
+
+  return insert.rows[0];
+}
+
 async function loadRegistry(client, tenantKey, sendyCampaignId) {
   const result = await client.query(
     `
@@ -588,6 +832,45 @@ async function handleSnapshotHandoff(req, res, config) {
       const batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
       const dispatchQueue = await ensureDispatchQueue(client, registry, config);
 
+      const mirrorGroups =
+        registry.source_system === "poweremail-test-reserve-mirror"
+          ? []
+          : await loadTestLeadMirrorGroups(client, tenant.tenant_id, recipients);
+      const mirrorDispatches = [];
+
+      for (const [index, mirrorGroup] of mirrorGroups.entries()) {
+        const mirrorRegistry = await createMirrorRegistry(client, tenant, registry, mirrorGroup, index + 1);
+        const mirrorCampaign = buildMirrorCampaign(campaign, mirrorGroup, registry.dispatch_campaign_id);
+        const mirrorContentSnapshotId = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign);
+        const mirrorAudienceSnapshotId = await createAudienceSnapshot(
+          client,
+          mirrorRegistry,
+          mirrorCampaign,
+          mirrorGroup.recipients
+        );
+        const mirrorRecipientCount = await insertRecipients(
+          client,
+          mirrorRegistry,
+          mirrorAudienceSnapshotId,
+          mirrorGroup.recipients
+        );
+        const mirrorBatchCount = await createBatches(client, mirrorRegistry, mirrorAudienceSnapshotId, batchSize);
+        const mirrorDispatchQueue = await ensureDispatchQueue(client, mirrorRegistry, config);
+
+        mirrorDispatches.push({
+          dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
+          fromEmail: mirrorGroup.fromEmail,
+          replyTo: mirrorGroup.replyTo,
+          reserveDomain: mirrorGroup.reserveDomain,
+          sourceRole: mirrorGroup.sourceRole,
+          recipientCount: mirrorRecipientCount,
+          batchCount: mirrorBatchCount,
+          contentSnapshotId: Number(mirrorContentSnapshotId),
+          audienceSnapshotId: Number(mirrorAudienceSnapshotId),
+          dispatchQueue: mirrorDispatchQueue,
+        });
+      }
+
       return {
         ok: true,
         tenantKey,
@@ -598,6 +881,7 @@ async function handleSnapshotHandoff(req, res, config) {
         recipientCount,
         batchCount,
         dispatchQueue,
+        mirrorDispatches,
         executionMode: config.executionMode,
       };
     });
