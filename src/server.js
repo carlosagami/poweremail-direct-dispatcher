@@ -319,7 +319,7 @@ async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGrou
       flow_type,
       'poweremail-test-reserve-mirror',
       $2,
-      sendy_campaign_id,
+      (($1::bigint * -10) - $3::bigint),
       sendy_campaign_name || ' [reserve mirror ' || $3::text || ']',
       subject,
       $4,
