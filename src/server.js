@@ -262,6 +262,10 @@ async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGrou
   );
 
   if (existing.rows[0]) {
+    if (existing.rows[0].direct_dispatch_state === "completed") {
+      throw httpError(409, `Mirror dispatch already completed for ${sourceObjectId}`);
+    }
+
     await client.query(
       `
       UPDATE control_plane.sendy_campaign_registry
