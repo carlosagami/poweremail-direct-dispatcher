@@ -278,8 +278,8 @@ async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGrou
              sendy_snapshot_json = COALESCE(sendy_snapshot_json, '{}'::jsonb) || jsonb_build_object(
                'test_reserve_mirror', true,
                'parent_dispatch_campaign_id', $1::bigint,
-               'reserve_domain', $4,
-               'source_role', $5
+               'reserve_domain', $4::text,
+               'source_role', $5::text
              ),
              updated_at = now()
        WHERE dispatch_campaign_id = $6
@@ -334,8 +334,8 @@ async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGrou
       sendy_snapshot_json || jsonb_build_object(
         'test_reserve_mirror', true,
         'parent_dispatch_campaign_id', dispatch_campaign_id,
-        'reserve_domain', $6,
-        'source_role', $7
+        'reserve_domain', $6::text,
+        'source_role', $7::text
       ),
       true,
       'pending'
