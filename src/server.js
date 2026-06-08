@@ -113,6 +113,51 @@ async function findTenant(client, tenantKey) {
   return result.rows[0];
 }
 
+async function resolveTenantFromSender(client, fromEmail) {
+  const normalizedFrom = optionalString(fromEmail);
+  if (!normalizedFrom || !normalizedFrom.includes("@")) return null;
+
+  const result = await client.query(
+    `
+    SELECT
+      t.tenant_id,
+      t.tenant_key,
+      'alias'::text AS source
+    FROM control_plane.tenant_aliases a
+    JOIN control_plane.tenants t
+      ON t.tenant_id = a.tenant_id
+    WHERE lower(a.from_email) = lower($1)
+      AND a.enabled = true
+      AND t.status = 'active'
+    LIMIT 1
+    `,
+    [normalizedFrom]
+  );
+
+  if (result.rows[0]) return result.rows[0];
+
+  const domain = normalizedFrom.split("@").pop().toLowerCase();
+
+  const domainResult = await client.query(
+    `
+    SELECT
+      t.tenant_id,
+      t.tenant_key,
+      'domain'::text AS source
+    FROM control_plane.tenant_domains d
+    JOIN control_plane.tenants t
+      ON t.tenant_id = d.tenant_id
+    WHERE lower(d.domain) = lower($1)
+      AND d.is_enabled = true
+      AND t.status = 'active'
+    LIMIT 1
+    `,
+    [domain]
+  );
+
+  return domainResult.rows[0] || null;
+}
+
 
 async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
   const emails = Array.from(
@@ -805,6 +850,7 @@ async function handleSnapshotHandoff(req, res, config) {
 
   const campaign = body.campaign || {};
   const recipients = Array.isArray(body.recipients) ? body.recipients : [];
+  const campaignFromEmail = optionalString(campaign.from_email || campaign.fromEmail);
 
   if (recipients.length === 0) {
     throw httpError(400, "recipients array is required for snapshot handoff");
@@ -824,7 +870,20 @@ async function handleSnapshotHandoff(req, res, config) {
 
   try {
     result = await db.tx(async (client) => {
-      const tenant = await findTenant(client, tenantKey);
+      const requestedTenant = await findTenant(client, tenantKey);
+      const senderTenant = await resolveTenantFromSender(client, campaignFromEmail);
+      const tenant = senderTenant || requestedTenant;
+
+      if (senderTenant && senderTenant.tenant_key !== requestedTenant.tenant_key) {
+        logger.warn("snapshot_handoff.tenant_overridden_by_sender", {
+          requested_tenant_key: requestedTenant.tenant_key,
+          resolved_tenant_key: senderTenant.tenant_key,
+          source: senderTenant.source,
+          from_email: campaignFromEmail,
+          sendy_campaign_id: sendyCampaignId,
+        });
+      }
+
       const registry = await upsertRegistry(client, tenant, sendyCampaignId, campaign);
       const contentSnapshotId = await createContentSnapshot(client, registry, campaign);
       const audienceSnapshotId = await createAudienceSnapshot(client, registry, campaign, recipients);
@@ -873,7 +932,8 @@ async function handleSnapshotHandoff(req, res, config) {
 
       return {
         ok: true,
-        tenantKey,
+        tenantKey: tenant.tenant_key,
+        requestedTenantKey: requestedTenant.tenant_key,
         sendyCampaignId,
         dispatchCampaignId: Number(registry.dispatch_campaign_id),
         contentSnapshotId: Number(contentSnapshotId),
