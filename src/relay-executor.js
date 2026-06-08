@@ -939,6 +939,8 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         text,
         html,
         headers: {
+          "X-PowerEmail-Tenant-Key": String(batch.tenant_key || ""),
+          "X-PowerEmail-Dispatch-Campaign-Id": String(batch.dispatch_campaign_id),
           "X-PowerEmail-Dispatch-Campaign": String(batch.dispatch_campaign_id),
           "X-PowerEmail-Batch-Key": batch.batch_key,
         },
