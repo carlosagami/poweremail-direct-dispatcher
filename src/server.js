@@ -158,6 +158,72 @@ async function resolveTenantFromSender(client, fromEmail) {
   return domainResult.rows[0] || null;
 }
 
+function fallbackDisplayNameFromEmail(fromEmail) {
+  const normalizedFrom = optionalString(fromEmail);
+  if (!normalizedFrom || !normalizedFrom.includes("@")) return null;
+
+  return normalizedFrom
+    .split("@")[0]
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+async function resolveSenderDisplayName(client, tenantId, fromEmail) {
+  const normalizedFrom = optionalString(fromEmail);
+  if (!normalizedFrom) return null;
+
+  const senderResult = await client.query(
+    `
+    SELECT display_name
+    FROM control_plane.tenant_senders
+    WHERE tenant_id = $1
+      AND lower(from_email) = lower($2)
+      AND is_enabled = true
+      AND display_name IS NOT NULL
+      AND btrim(display_name) <> ''
+    LIMIT 1
+    `,
+    [tenantId, normalizedFrom]
+  );
+
+  if (senderResult.rows[0]?.display_name) {
+    return {
+      displayName: senderResult.rows[0].display_name,
+      source: "tenant_senders",
+    };
+  }
+
+  const tenantResult = await client.query(
+    `
+    SELECT display_name
+    FROM control_plane.tenants
+    WHERE tenant_id = $1
+      AND display_name IS NOT NULL
+      AND btrim(display_name) <> ''
+    LIMIT 1
+    `,
+    [tenantId]
+  );
+
+  if (tenantResult.rows[0]?.display_name) {
+    return {
+      displayName: tenantResult.rows[0].display_name,
+      source: "tenants",
+    };
+  }
+
+  const fallbackDisplayName = fallbackDisplayNameFromEmail(normalizedFrom);
+
+  return fallbackDisplayName
+    ? {
+        displayName: fallbackDisplayName,
+        source: "email_localpart",
+      }
+    : null;
+}
+
 
 async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
   const emails = Array.from(
@@ -884,9 +950,31 @@ async function handleSnapshotHandoff(req, res, config) {
         });
       }
 
-      const registry = await upsertRegistry(client, tenant, sendyCampaignId, campaign);
-      const contentSnapshotId = await createContentSnapshot(client, registry, campaign);
-      const audienceSnapshotId = await createAudienceSnapshot(client, registry, campaign, recipients);
+      const senderDisplayName = await resolveSenderDisplayName(
+        client,
+        tenant.tenant_id,
+        campaignFromEmail
+      );
+
+      const effectiveCampaign = {
+        ...campaign,
+        from_name: senderDisplayName?.displayName || campaign.from_name || campaign.fromName || null,
+        fromName: senderDisplayName?.displayName || campaign.fromName || campaign.from_name || null,
+      };
+
+      if (senderDisplayName?.displayName) {
+        logger.info("snapshot_handoff.sender_display_name_applied", {
+          tenant_key: tenant.tenant_key,
+          from_email: campaignFromEmail,
+          display_name: senderDisplayName.displayName,
+          source: senderDisplayName.source,
+          sendy_campaign_id: sendyCampaignId,
+        });
+      }
+
+      const registry = await upsertRegistry(client, tenant, sendyCampaignId, effectiveCampaign);
+      const contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign);
+      const audienceSnapshotId = await createAudienceSnapshot(client, registry, effectiveCampaign, recipients);
       const recipientCount = await insertRecipients(client, registry, audienceSnapshotId, recipients);
       const batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
       const dispatchQueue = await ensureDispatchQueue(client, registry, config);
@@ -899,7 +987,7 @@ async function handleSnapshotHandoff(req, res, config) {
 
       for (const [index, mirrorGroup] of mirrorGroups.entries()) {
         const mirrorRegistry = await createMirrorRegistry(client, tenant, registry, mirrorGroup, index + 1);
-        const mirrorCampaign = buildMirrorCampaign(campaign, mirrorGroup, registry.dispatch_campaign_id);
+        const mirrorCampaign = buildMirrorCampaign(effectiveCampaign, mirrorGroup, registry.dispatch_campaign_id);
         const mirrorContentSnapshotId = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign);
         const mirrorAudienceSnapshotId = await createAudienceSnapshot(
           client,
