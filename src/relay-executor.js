@@ -54,6 +54,21 @@ function isBatchEmptyError(err) {
   return err?.message === BATCH_EMPTY_ERROR_MESSAGE;
 }
 
+function escapeDisplayName(displayName) {
+  return String(displayName || "").replace(/"/g, '\\"').trim();
+}
+
+function formatFromHeader(content, fallbackFromEmail) {
+  const fromEmail = String(content.from_email || fallbackFromEmail || "").trim();
+  const fromName = escapeDisplayName(content.from_name);
+
+  if (fromName && fromEmail) {
+    return `"${fromName}" <${fromEmail}>`;
+  }
+
+  return fromEmail;
+}
+
 async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
   const { rows } = await cpDb.query(
     `
@@ -932,7 +947,7 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       const html = personalizeText(content.html_text || "", recipient);
 
       await transporter.sendMail({
-        from: content.from_email || config.relayFromEmail,
+        from: formatFromHeader(content, config.relayFromEmail),
         to: recipient.email,
         replyTo: content.reply_to || undefined,
         subject,
