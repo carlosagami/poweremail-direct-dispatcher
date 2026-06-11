@@ -322,7 +322,7 @@ async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
     const recipient = recipientsByEmail.get(row.email_norm);
     if (!recipient) continue;
 
-    const key = row.mirror_from_email;
+    const key = row.reserve_domain;
     if (!groups.has(key)) {
       groups.set(key, {
         fromEmail: row.mirror_from_email,
