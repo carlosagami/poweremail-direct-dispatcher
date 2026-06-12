@@ -322,7 +322,7 @@ async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
     const recipient = recipientsByEmail.get(row.email_norm);
     if (!recipient) continue;
 
-    const key = row.reserve_domain;
+    const key = row.mirror_from_email;
     if (!groups.has(key)) {
       groups.set(key, {
         fromEmail: row.mirror_from_email,
@@ -357,7 +357,12 @@ function buildMirrorCampaign(campaign, mirrorGroup, parentDispatchCampaignId) {
 }
 
 async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGroup, index) {
-  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}`;
+  const mirrorAliasKey = String(mirrorGroup.fromEmail || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._+-@]/g, "_");
+
+  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}:${mirrorAliasKey}`;
 
   const existing = await client.query(
     `
