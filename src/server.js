@@ -909,6 +909,204 @@ async function ensureDispatchQueue(client, registry, config) {
   return "created";
 }
 
+
+async function loadTestLeadParentGroups(client, tenantId, recipients) {
+  const emails = Array.from(
+    new Set(
+      recipients
+        .map((recipient) => String(recipient.email || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+
+  if (emails.length === 0) return [];
+
+  const result = await client.query(
+    `
+    SELECT
+      o.email_norm,
+      o.pinned_from_email,
+      split_part(o.pinned_from_email, '@', 1) AS localpart,
+      split_part(o.pinned_from_email, '@', 2) AS pinned_domain,
+      td.role
+    FROM control_plane.tenant_test_lead_alias_overrides o
+    JOIN control_plane.tenant_domains td
+      ON td.tenant_id = o.tenant_id
+     AND td.domain = split_part(o.pinned_from_email, '@', 2)
+     AND td.is_enabled = true
+    JOIN control_plane.tenant_aliases a
+      ON a.tenant_id = o.tenant_id
+     AND lower(a.from_email) = lower(o.pinned_from_email)
+     AND a.enabled = true
+    WHERE o.tenant_id = $1
+      AND o.enabled = true
+      AND o.email_norm = ANY($2::text[])
+      AND td.role IN ('primary', 'standby')
+    ORDER BY td.role, o.email_norm
+    `,
+    [tenantId, emails]
+  );
+
+  const recipientsByEmail = new Map(
+    recipients.map((recipient) => [
+      String(recipient.email || "").trim().toLowerCase(),
+      recipient,
+    ])
+  );
+
+  const groups = new Map();
+
+  for (const row of result.rows) {
+    const recipient = recipientsByEmail.get(row.email_norm);
+    if (!recipient) continue;
+
+    const key = String(row.pinned_from_email || "").trim().toLowerCase();
+    if (!key) continue;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        fromEmail: row.pinned_from_email,
+        replyTo: `${row.localpart}@mail.${row.pinned_domain}`,
+        sourceRole: row.role,
+        recipients: [],
+      });
+    }
+
+    groups.get(key).recipients.push(recipient);
+  }
+
+  return Array.from(groups.values());
+}
+
+function buildPinnedParentCampaign(campaign, parentGroup, parentDispatchCampaignId) {
+  return {
+    ...campaign,
+    from_email: parentGroup.fromEmail,
+    fromEmail: parentGroup.fromEmail,
+    reply_to: parentGroup.replyTo,
+    replyTo: parentGroup.replyTo,
+    source_json: {
+      ...(campaign.source_json || {}),
+      test_parent_alias: true,
+      parent_dispatch_campaign_id: parentDispatchCampaignId,
+      source_role: parentGroup.sourceRole,
+    },
+  };
+}
+
+async function createPinnedParentRegistry(client, tenant, originalRegistry, parentGroup, index) {
+  const parentAliasKey = String(parentGroup.fromEmail || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._+-@]/g, "_");
+
+  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:parent:${parentAliasKey}`;
+
+  const existing = await client.query(
+    `
+    SELECT dispatch_campaign_id, tenant_id, tenant_key, sendy_campaign_id, direct_dispatch_state
+    FROM control_plane.sendy_campaign_registry
+    WHERE tenant_key = $1
+      AND source_system = 'poweremail-test-parent-alias'
+      AND source_object_id = $2
+    ORDER BY dispatch_campaign_id DESC
+    LIMIT 1
+    `,
+    [tenant.tenant_key, sourceObjectId]
+  );
+
+  if (existing.rows[0]) {
+    if (existing.rows[0].direct_dispatch_state === "completed") {
+      throw httpError(409, `Pinned parent dispatch already completed for ${sourceObjectId}`);
+    }
+
+    await client.query(
+      `
+      UPDATE control_plane.sendy_campaign_registry
+         SET from_email = $2,
+             reply_to = $3,
+             direct_dispatch_state = CASE
+               WHEN direct_dispatch_state = 'completed' THEN direct_dispatch_state
+               ELSE 'pending'
+             END,
+             sendy_snapshot_json = COALESCE(sendy_snapshot_json, '{}'::jsonb) || jsonb_build_object(
+               'test_parent_alias', true,
+               'parent_dispatch_campaign_id', $1::bigint,
+               'source_role', $4::text
+             ),
+             updated_at = now()
+       WHERE dispatch_campaign_id = $5
+      `,
+      [
+        originalRegistry.dispatch_campaign_id,
+        parentGroup.fromEmail,
+        parentGroup.replyTo,
+        parentGroup.sourceRole,
+        existing.rows[0].dispatch_campaign_id,
+      ]
+    );
+
+    return existing.rows[0];
+  }
+
+  const insert = await client.query(
+    `
+    INSERT INTO control_plane.sendy_campaign_registry (
+      tenant_id,
+      tenant_key,
+      flow_type,
+      source_system,
+      source_object_id,
+      sendy_campaign_id,
+      sendy_campaign_name,
+      subject,
+      from_email,
+      reply_to,
+      campaign_state,
+      approved_at,
+      approved_by,
+      sendy_snapshot_json,
+      direct_dispatch_enabled,
+      direct_dispatch_state
+    )
+    SELECT
+      tenant_id,
+      tenant_key,
+      flow_type,
+      'poweremail-test-parent-alias',
+      $2,
+      (($1::bigint * -1000) - $3::bigint),
+      sendy_campaign_name || ' [parent alias ' || $3::text || ']',
+      subject,
+      $4,
+      $5,
+      campaign_state,
+      now(),
+      'poweremail-parent-alias-dispatch',
+      sendy_snapshot_json || jsonb_build_object(
+        'test_parent_alias', true,
+        'parent_dispatch_campaign_id', dispatch_campaign_id,
+        'source_role', $6::text
+      ),
+      true,
+      'pending'
+    FROM control_plane.sendy_campaign_registry
+    WHERE dispatch_campaign_id = $1
+    RETURNING dispatch_campaign_id, tenant_id, tenant_key, sendy_campaign_id, direct_dispatch_state
+    `,
+    [
+      originalRegistry.dispatch_campaign_id,
+      sourceObjectId,
+      index,
+      parentGroup.fromEmail,
+      parentGroup.replyTo,
+      parentGroup.sourceRole,
+    ]
+  );
+
+  return insert.rows[0];
+}
+
 async function handleSnapshotHandoff(req, res, config) {
   assertAuthorized(req);
 
@@ -978,11 +1176,80 @@ async function handleSnapshotHandoff(req, res, config) {
       }
 
       const registry = await upsertRegistry(client, tenant, sendyCampaignId, effectiveCampaign);
-      const contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign);
-      const audienceSnapshotId = await createAudienceSnapshot(client, registry, effectiveCampaign, recipients);
-      const recipientCount = await insertRecipients(client, registry, audienceSnapshotId, recipients);
-      const batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
-      const dispatchQueue = await ensureDispatchQueue(client, registry, config);
+      const parentGroups = await loadTestLeadParentGroups(client, tenant.tenant_id, recipients);
+      const pinnedRecipientEmails = new Set();
+
+      for (const parentGroup of parentGroups) {
+        for (const recipient of parentGroup.recipients) {
+          const email = String(recipient.email || "").trim().toLowerCase();
+          if (email) pinnedRecipientEmails.add(email);
+        }
+      }
+
+      const globalRecipients = recipients.filter((recipient) => {
+        const email = String(recipient.email || "").trim().toLowerCase();
+        return !pinnedRecipientEmails.has(email);
+      });
+
+      let contentSnapshotId = null;
+      let audienceSnapshotId = null;
+      let recipientCount = 0;
+      let batchCount = 0;
+      let dispatchQueue = "skipped";
+
+      if (globalRecipients.length > 0) {
+        contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign);
+        audienceSnapshotId = await createAudienceSnapshot(client, registry, effectiveCampaign, globalRecipients);
+        recipientCount = await insertRecipients(client, registry, audienceSnapshotId, globalRecipients);
+        batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
+        dispatchQueue = await ensureDispatchQueue(client, registry, config);
+      }
+
+      if (globalRecipients.length === 0) {
+        await client.query(
+          `
+          UPDATE control_plane.sendy_campaign_registry
+             SET direct_dispatch_state = 'cancelled',
+                 updated_at = now()
+           WHERE dispatch_campaign_id = $1
+          `,
+          [registry.dispatch_campaign_id]
+        );
+      }
+
+      const parentAliasDispatches = [];
+
+      for (const [index, parentGroup] of parentGroups.entries()) {
+        const parentRegistry = await createPinnedParentRegistry(client, tenant, registry, parentGroup, index + 1);
+        const parentCampaign = buildPinnedParentCampaign(effectiveCampaign, parentGroup, registry.dispatch_campaign_id);
+        const parentContentSnapshotId = await createContentSnapshot(client, parentRegistry, parentCampaign);
+        const parentAudienceSnapshotId = await createAudienceSnapshot(
+          client,
+          parentRegistry,
+          parentCampaign,
+          parentGroup.recipients
+        );
+        const parentRecipientCount = await insertRecipients(
+          client,
+          parentRegistry,
+          parentAudienceSnapshotId,
+          parentGroup.recipients
+        );
+        const parentBatchCount = await createBatches(client, parentRegistry, parentAudienceSnapshotId, batchSize);
+        const parentDispatchQueue = await ensureDispatchQueue(client, parentRegistry, config);
+
+        parentAliasDispatches.push({
+          dispatchCampaignId: Number(parentRegistry.dispatch_campaign_id),
+          fromEmail: parentGroup.fromEmail,
+          replyTo: parentGroup.replyTo,
+          sourceRole: parentGroup.sourceRole,
+          recipientCount: parentRecipientCount,
+          batchCount: parentBatchCount,
+          contentSnapshotId: Number(parentContentSnapshotId),
+          audienceSnapshotId: Number(parentAudienceSnapshotId),
+          dispatchQueue: parentDispatchQueue,
+        });
+      }
 
       const mirrorGroups =
         registry.source_system === "poweremail-test-reserve-mirror"
@@ -1034,6 +1301,7 @@ async function handleSnapshotHandoff(req, res, config) {
         recipientCount,
         batchCount,
         dispatchQueue,
+        parentAliasDispatches,
         mirrorDispatches,
         executionMode: config.executionMode,
       };
