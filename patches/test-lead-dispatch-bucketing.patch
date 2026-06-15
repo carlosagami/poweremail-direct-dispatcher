@@ -1,0 +1,175 @@
+diff --git a/src/server.js b/src/server.js
+--- a/src/server.js
++++ b/src/server.js
+@@
+ function boolFromSendy(value) {
+@@
+ }
++
++function parseRecipientCustomFields(recipient) {
++  const raw = recipient.customFields || recipient.custom_fields_json || {};
++  if (!raw) return {};
++  if (typeof raw === "object" && !Array.isArray(raw)) return { ...raw };
++  try {
++    const parsed = JSON.parse(String(raw));
++    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
++  } catch (_) {
++    return {};
++  }
++}
++
++function withPowerEmailSenderOverride(recipient, fromEmail, replyTo, senderBucket) {
++  return {
++    ...recipient,
++    customFields: {
++      ...parseRecipientCustomFields(recipient),
++      __poweremail_from_email: fromEmail,
++      __poweremail_reply_to: replyTo,
++      __poweremail_sender_bucket: senderBucket,
++    },
++  };
++}
+@@
+-    const key = row.mirror_from_email;
++    const key = row.reserve_domain;
+     if (!groups.has(key)) {
+       groups.set(key, {
+         fromEmail: row.mirror_from_email,
+         replyTo: row.mirror_reply_to,
+         reserveDomain: row.reserve_domain,
+         sourceRole: row.role,
++        senderBucket: `reserve:${row.reserve_domain}`,
+         recipients: [],
+       });
+     }
+ 
+-    groups.get(key).recipients.push(recipient);
++    groups.get(key).recipients.push(
++      withPowerEmailSenderOverride(
++        recipient,
++        row.mirror_from_email,
++        row.mirror_reply_to,
++        `reserve:${row.reserve_domain}`
++      )
++    );
+   }
+@@
+ async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGroup, index) {
+-  const mirrorAliasKey = String(mirrorGroup.fromEmail || "")
+-    .trim()
+-    .toLowerCase()
+-    .replace(/[^a-z0-9._+-@]/g, "_");
+-
+-  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}:${mirrorAliasKey}`;
++  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}`;
+@@
+-    const key = String(row.pinned_from_email || "").trim().toLowerCase();
++    const key = `${row.role}:${row.pinned_domain}`;
+     if (!key) continue;
+ 
+     if (!groups.has(key)) {
+       groups.set(key, {
+         fromEmail: row.pinned_from_email,
+         replyTo: `${row.localpart}@mail.${row.pinned_domain}`,
+         sourceRole: row.role,
++        senderBucket: key,
+         recipients: [],
+       });
+     }
+ 
+-    groups.get(key).recipients.push(recipient);
++    groups.get(key).recipients.push(
++      withPowerEmailSenderOverride(
++        recipient,
++        row.pinned_from_email,
++        `${row.localpart}@mail.${row.pinned_domain}`,
++        key
++      )
++    );
+   }
+@@
+ async function createPinnedParentRegistry(client, tenant, originalRegistry, parentGroup, index) {
+-  const parentAliasKey = String(parentGroup.fromEmail || "")
++  const parentBucketKey = String(parentGroup.senderBucket || parentGroup.fromEmail || "")
+     .trim()
+     .toLowerCase()
+     .replace(/[^a-z0-9._+-@]/g, "_");
+ 
+-  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:parent:${parentAliasKey}`;
++  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:parent:${parentBucketKey}`;
+diff --git a/src/relay-executor.js b/src/relay-executor.js
+--- a/src/relay-executor.js
++++ b/src/relay-executor.js
+@@
+-function formatFromHeader(content, fallbackFromEmail) {
+-  const fromEmail = String(content.from_email || fallbackFromEmail || "").trim();
++function formatFromHeader(content, fallbackFromEmail, overrideFromEmail = null) {
++  const fromEmail = String(overrideFromEmail || content.from_email || fallbackFromEmail || "").trim();
+   const fromName = escapeDisplayName(content.from_name);
+@@
+   return fromEmail;
+ }
++
++function parseRecipientCustomFields(value) {
++  if (!value) return {};
++  if (typeof value === "object" && !Array.isArray(value)) return value;
++  try {
++    const parsed = JSON.parse(String(value));
++    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
++  } catch (_) {
++    return {};
++  }
++}
++
++function emailDomain(email) {
++  const text = String(email || "").trim().toLowerCase();
++  return text.includes("@") ? text.split("@").pop() : null;
++}
++
++function getRecipientSenderOverride(recipient) {
++  const fields = parseRecipientCustomFields(recipient.custom_fields_json);
++  const fromEmail = String(fields.__poweremail_from_email || "").trim();
++  const replyTo = String(fields.__poweremail_reply_to || "").trim();
++  const senderBucket = String(fields.__poweremail_sender_bucket || "").trim();
++
++  return fromEmail
++    ? {
++        fromEmail,
++        replyTo: replyTo || null,
++        senderBucket: senderBucket || null,
++      }
++    : null;
++}
+@@
+       const subject = personalizeText(content.subject || "", recipient);
+       const text = personalizeText(content.plain_text || "", recipient);
+       const html = personalizeText(content.html_text || "", recipient);
++      const senderOverride = getRecipientSenderOverride(recipient);
++
++      if (senderOverride) {
++        logger.info("relay_executor.recipient_sender_override_applied", {
++          sendy_campaign_id: batch.sendy_campaign_id,
++          tenant_key: batch.tenant_key,
++          dispatch_campaign_id: batch.dispatch_campaign_id,
++          batch_key: batch.batch_key,
++          recipient_queue_id: recipient.recipient_queue_id,
++          recipient_email: recipient.email,
++          from_domain: emailDomain(senderOverride.fromEmail),
++          reply_to_domain: emailDomain(senderOverride.replyTo),
++          sender_bucket: senderOverride.senderBucket,
++        });
++      }
+ 
+       await transporter.sendMail({
+-        from: formatFromHeader(content, config.relayFromEmail),
++        from: formatFromHeader(
++          content,
++          config.relayFromEmail,
++          senderOverride?.fromEmail || null
++        ),
+         to: recipient.email,
+-        replyTo: content.reply_to || undefined,
++        replyTo: senderOverride?.replyTo || content.reply_to || undefined,
+         subject,
+         text,
+         html,
