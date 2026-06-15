@@ -94,6 +94,30 @@ function boolFromSendy(value) {
   return null;
 }
 
+function parseRecipientCustomFields(recipient) {
+  const raw = recipient.customFields || recipient.custom_fields_json || {};
+  if (!raw) return {};
+  if (typeof raw === "object" && !Array.isArray(raw)) return { ...raw };
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function withPowerEmailSenderOverride(recipient, fromEmail, replyTo, senderBucket) {
+  return {
+    ...recipient,
+    customFields: {
+      ...parseRecipientCustomFields(recipient),
+      __poweremail_from_email: fromEmail,
+      __poweremail_reply_to: replyTo,
+      __poweremail_sender_bucket: senderBucket,
+    },
+  };
+}
+
 async function findTenant(client, tenantKey) {
   const result = await client.query(
     `
@@ -322,18 +346,26 @@ async function loadTestLeadMirrorGroups(client, tenantId, recipients) {
     const recipient = recipientsByEmail.get(row.email_norm);
     if (!recipient) continue;
 
-    const key = row.mirror_from_email;
+    const key = row.reserve_domain;
     if (!groups.has(key)) {
       groups.set(key, {
         fromEmail: row.mirror_from_email,
         replyTo: row.mirror_reply_to,
         reserveDomain: row.reserve_domain,
         sourceRole: row.role,
+        senderBucket: `reserve:${row.reserve_domain}`,
         recipients: [],
       });
     }
 
-    groups.get(key).recipients.push(recipient);
+    groups.get(key).recipients.push(
+      withPowerEmailSenderOverride(
+        recipient,
+        row.mirror_from_email,
+        row.mirror_reply_to,
+        `reserve:${row.reserve_domain}`
+      )
+    );
   }
 
   return Array.from(groups.values());
@@ -357,12 +389,7 @@ function buildMirrorCampaign(campaign, mirrorGroup, parentDispatchCampaignId) {
 }
 
 async function createMirrorRegistry(client, tenant, originalRegistry, mirrorGroup, index) {
-  const mirrorAliasKey = String(mirrorGroup.fromEmail || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._+-@]/g, "_");
-
-  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}:${mirrorAliasKey}`;
+  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:mirror:${mirrorGroup.reserveDomain}`;
 
   const existing = await client.query(
     `
@@ -960,7 +987,7 @@ async function loadTestLeadParentGroups(client, tenantId, recipients) {
     const recipient = recipientsByEmail.get(row.email_norm);
     if (!recipient) continue;
 
-    const key = String(row.pinned_from_email || "").trim().toLowerCase();
+    const key = `${row.role}:${row.pinned_domain}`;
     if (!key) continue;
 
     if (!groups.has(key)) {
@@ -968,11 +995,19 @@ async function loadTestLeadParentGroups(client, tenantId, recipients) {
         fromEmail: row.pinned_from_email,
         replyTo: `${row.localpart}@mail.${row.pinned_domain}`,
         sourceRole: row.role,
+        senderBucket: key,
         recipients: [],
       });
     }
 
-    groups.get(key).recipients.push(recipient);
+    groups.get(key).recipients.push(
+      withPowerEmailSenderOverride(
+        recipient,
+        row.pinned_from_email,
+        `${row.localpart}@mail.${row.pinned_domain}`,
+        key
+      )
+    );
   }
 
   return Array.from(groups.values());
@@ -995,12 +1030,12 @@ function buildPinnedParentCampaign(campaign, parentGroup, parentDispatchCampaign
 }
 
 async function createPinnedParentRegistry(client, tenant, originalRegistry, parentGroup, index) {
-  const parentAliasKey = String(parentGroup.fromEmail || "")
+  const parentBucketKey = String(parentGroup.senderBucket || parentGroup.fromEmail || "")
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9._+-@]/g, "_");
 
-  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:parent:${parentAliasKey}`;
+  const sourceObjectId = `${originalRegistry.sendy_campaign_id}:parent:${parentBucketKey}`;
 
   const existing = await client.query(
     `

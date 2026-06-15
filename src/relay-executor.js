@@ -58,8 +58,8 @@ function escapeDisplayName(displayName) {
   return String(displayName || "").replace(/"/g, '\\"').trim();
 }
 
-function formatFromHeader(content, fallbackFromEmail) {
-  const fromEmail = String(content.from_email || fallbackFromEmail || "").trim();
+function formatFromHeader(content, fallbackFromEmail, overrideFromEmail = null) {
+  const fromEmail = String(overrideFromEmail || content.from_email || fallbackFromEmail || "").trim();
   const fromName = escapeDisplayName(content.from_name);
 
   if (fromName && fromEmail) {
@@ -67,6 +67,37 @@ function formatFromHeader(content, fallbackFromEmail) {
   }
 
   return fromEmail;
+}
+
+function parseRecipientCustomFields(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function emailDomain(email) {
+  const text = String(email || "").trim().toLowerCase();
+  return text.includes("@") ? text.split("@").pop() : null;
+}
+
+function getRecipientSenderOverride(recipient) {
+  const fields = parseRecipientCustomFields(recipient.custom_fields_json);
+  const fromEmail = String(fields.__poweremail_from_email || "").trim();
+  const replyTo = String(fields.__poweremail_reply_to || "").trim();
+  const senderBucket = String(fields.__poweremail_sender_bucket || "").trim();
+
+  return fromEmail
+    ? {
+        fromEmail,
+        replyTo: replyTo || null,
+        senderBucket: senderBucket || null,
+      }
+    : null;
 }
 
 async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
@@ -945,11 +976,30 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       const subject = personalizeText(content.subject || "", recipient);
       const text = personalizeText(content.plain_text || "", recipient);
       const html = personalizeText(content.html_text || "", recipient);
+      const senderOverride = getRecipientSenderOverride(recipient);
+
+      if (senderOverride) {
+        logger.info("relay_executor.recipient_sender_override_applied", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          recipient_queue_id: recipient.recipient_queue_id,
+          recipient_email: recipient.email,
+          from_domain: emailDomain(senderOverride.fromEmail),
+          reply_to_domain: emailDomain(senderOverride.replyTo),
+          sender_bucket: senderOverride.senderBucket,
+        });
+      }
 
       await transporter.sendMail({
-        from: formatFromHeader(content, config.relayFromEmail),
+        from: formatFromHeader(
+          content,
+          config.relayFromEmail,
+          senderOverride?.fromEmail || null
+        ),
         to: recipient.email,
-        replyTo: content.reply_to || undefined,
+        replyTo: senderOverride?.replyTo || content.reply_to || undefined,
         subject,
         text,
         html,
