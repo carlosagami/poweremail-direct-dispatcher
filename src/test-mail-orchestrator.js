@@ -126,6 +126,32 @@ function topicForSlot(brand, slot) {
   return brand.topics[index];
 }
 
+function buildHtmlFromPlainText(plainText) {
+  const escapeHtml = (value) =>
+    String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  return String(plainText)
+    .trim()
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>\n")}</p>`)
+    .join("<br>\n");
+}
+
+function normalizeHtmlSpacing(htmlText, plainText) {
+  const html = String(htmlText || "").trim();
+  if (!html) return buildHtmlFromPlainText(plainText);
+  if (/<p[\s>]/i.test(html)) {
+    return html
+      .replace(/<\/p>\s*<p/gi, "</p><br>\n<p")
+      .replace(/<\/p>\s*$/i, "</p>");
+  }
+  return buildHtmlFromPlainText(plainText);
+}
+
 function buildLocalCopy(brand, slot) {
   const topic = topicForSlot(brand, slot);
   const subjectMap = {
@@ -158,7 +184,7 @@ function buildLocalCopy(brand, slot) {
   return {
     subject,
     plainText: body,
-    htmlText: body.replace(/\n/g, "<br>\n"),
+    htmlText: buildHtmlFromPlainText(body),
     topic,
     source: "local",
   };
@@ -197,14 +223,17 @@ function copyPrompt(brand, slot, topic, dateText) {
     "Genera un correo outbound breve en espanol neutro/latam.",
     "Responde exclusivamente JSON valido con estas llaves: subject, plainText, htmlText.",
     "No uses markdown. No incluyas explicaciones.",
-    "El correo debe sonar humano, concreto y distinto a una plantilla generica.",
-    "Debe reflejar el contexto de la marca que envia y el tema del slot.",
+    "El correo debe sonar humano, especifico y contextual a la marca que envia.",
+    "No debe sonar a brochure, pitch comercial ni plantilla generica.",
+    "Usa una observacion concreta del contexto del negocio y luego una pregunta o siguiente paso suave.",
+    "Evita estas frases y construcciones: 'queria contarte', 'contamos con', 'te ofrecemos', 'tenemos la solucion', 'te gustaria saber mas', 'agenda una llamada', 'descubre', 'potencia', 'ideal para'.",
     "No prometas descuentos, resultados garantizados, urgencias falsas ni claims medicos.",
     "No menciones que fue generado por IA.",
     "JAMAS incluyas una direccion de correo electronico en subject, plainText o htmlText.",
-    "El subject debe tener maximo 75 caracteres.",
-    "El plainText debe tener 80 a 150 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
-    "El htmlText debe ser el mismo contenido en HTML simple con parrafos y sin estilos inline.",
+    "El subject debe tener maximo 75 caracteres y sonar natural, no promocional.",
+    "El plainText debe tener 70 a 130 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
+    "El htmlText debe contener el mismo contenido que plainText en HTML simple.",
+    "En htmlText separa cada parrafo con una linea <br> entre etiquetas </p> y <p>.",
     "Datos del envio:",
     JSON.stringify({
       tenantKey: brand.tenantKey,
@@ -310,7 +339,7 @@ function assertCopyHasNoEmailAddress(subject, plainText, htmlText) {
 function normalizeAiCopy(candidate, fallback) {
   const subject = String(candidate.subject || "").trim();
   const plainText = String(candidate.plainText || candidate.plain_text || "").trim();
-  const htmlText = String(candidate.htmlText || candidate.html_text || "").trim();
+  const htmlText = normalizeHtmlSpacing(candidate.htmlText || candidate.html_text, plainText);
 
   if (!subject || !plainText || !htmlText) {
     throw new Error("AI copy is missing subject, plainText, or htmlText");
