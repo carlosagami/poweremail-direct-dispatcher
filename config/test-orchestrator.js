@@ -3,12 +3,18 @@
 module.exports = {
   timezone: "America/Mexico_City",
   sendWindow: {
-    startHour: 7,
-    endHour: 19,
+    startHour: 8,
+    endHour: 18,
   },
   dailySends: {
-    minPerBrand: 5,
-    maxPerBrand: 7,
+    weekdays: {
+      minPerBrand: 5,
+      maxPerBrand: 7,
+    },
+    weekends: {
+      minPerBrand: 1,
+      maxPerBrand: 3,
+    },
   },
   intervalJitter: {
     minHours: 2,
