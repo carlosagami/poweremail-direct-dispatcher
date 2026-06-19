@@ -10,6 +10,7 @@ const orchestratorConfig = require("../config/test-orchestrator");
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
 const COPY_MODES = new Set(["auto", "ai", "local"]);
+const EMAIL_ADDRESS_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 
 function hashInt(input) {
   const digest = crypto.createHash("sha256").update(String(input)).digest();
@@ -166,6 +167,7 @@ function copyPrompt(brand, slot, topic, dateText) {
     "Debe reflejar el contexto de la marca que envia y el tema del slot.",
     "No prometas descuentos, resultados garantizados, urgencias falsas ni claims medicos.",
     "No menciones que fue generado por IA.",
+    "JAMAS incluyas una direccion de correo electronico en subject, plainText o htmlText.",
     "El subject debe tener maximo 75 caracteres.",
     "El plainText debe tener 80 a 150 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
     "El htmlText debe ser el mismo contenido en HTML simple con parrafos y sin estilos inline.",
@@ -257,6 +259,20 @@ async function callOpenAi(prompt) {
   return JSON.parse(generated);
 }
 
+function containsEmailAddress(value) {
+  return EMAIL_ADDRESS_PATTERN.test(String(value || ""));
+}
+
+function assertCopyHasNoEmailAddress(subject, plainText, htmlText) {
+  if (
+    containsEmailAddress(subject) ||
+    containsEmailAddress(plainText) ||
+    containsEmailAddress(htmlText)
+  ) {
+    throw new Error("Generated copy contains a visible email address");
+  }
+}
+
 function normalizeAiCopy(candidate, fallback) {
   const subject = String(candidate.subject || "").trim();
   const plainText = String(candidate.plainText || candidate.plain_text || "").trim();
@@ -265,6 +281,7 @@ function normalizeAiCopy(candidate, fallback) {
   if (!subject || !plainText || !htmlText) {
     throw new Error("AI copy is missing subject, plainText, or htmlText");
   }
+  assertCopyHasNoEmailAddress(subject, plainText, htmlText);
 
   return {
     ...fallback,
