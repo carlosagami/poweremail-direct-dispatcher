@@ -3,7 +3,6 @@
 const crypto = require("crypto");
 const { loadServiceConfig } = require("./config");
 const { createControlPlaneDb } = require("./db");
-const { createSendyDb } = require("./sendy-db");
 const logger = require("./logger");
 const { chunkError } = require("./utils");
 const orchestratorConfig = require("../config/test-orchestrator");
@@ -71,10 +70,7 @@ function buildDailySlots(brand, dateText = localDateString()) {
 
   for (let i = 0; i < count; i += 1) {
     const jitter = Math.floor((random() - 0.5) * Math.min(baseGap * 0.7, 55));
-    const minuteOfDay = Math.max(
-      start,
-      Math.min(end - 1, Math.floor(start + baseGap * i + baseGap / 2 + jitter))
-    );
+    const minuteOfDay = Math.max(start, Math.min(end - 1, Math.floor(start + baseGap * i + baseGap / 2 + jitter)));
     slots.push({
       slotIndex: i + 1,
       hour: Math.floor(minuteOfDay / 60),
@@ -123,25 +119,29 @@ function buildCopy(brand, slot) {
   return { subject, plainText: body, htmlText: body.replace(/\n/g, "<br>\n") };
 }
 
-async function loadActiveRecipients(sendyDb, listId) {
-  return sendyDb.query(
+async function loadActiveRecipients(cpDb, tenantKey, listId) {
+  const { rows } = await cpDb.query(
     `
     SELECT
-      id AS sendySubscriberId,
-      list AS sendyListId,
-      email,
-      name,
-      custom_fields AS customFields
-    FROM subscribers
-    WHERE list = ?
-      AND unsubscribed = 0
-      AND bounced = 0
-      AND complaint = 0
-      AND confirmed = 1
-    ORDER BY id ASC
+      o.override_id AS "sendySubscriberId",
+      $2::integer AS "sendyListId",
+      o.email_norm AS email,
+      NULL::text AS name,
+      jsonb_build_object(
+        'source', 'tenant_test_lead_alias_overrides',
+        'sendy_test_list_id', $2::integer
+      ) AS "customFields"
+    FROM control_plane.tenants t
+    JOIN control_plane.tenant_test_lead_alias_overrides o
+      ON o.tenant_id = t.tenant_id
+     AND o.enabled = true
+    WHERE t.tenant_key = $1
+      AND t.status = 'active'
+    ORDER BY o.email_norm ASC
     `,
-    [listId]
+    [tenantKey, listId]
   );
+  return rows;
 }
 
 async function loadBaseSender(cpDb, tenantKey) {
@@ -266,13 +266,12 @@ async function main() {
   const dateText = localDateString();
   const config = loadServiceConfig();
   const cpDb = createControlPlaneDb(config);
-  const sendyDb = createSendyDb(config);
 
   try {
     const planned = [];
 
     for (const brand of selectedBrands()) {
-      const recipients = await loadActiveRecipients(sendyDb, brand.sendyTestListId);
+      const recipients = await loadActiveRecipients(cpDb, brand.tenantKey, brand.sendyTestListId);
       const sender = await loadBaseSender(cpDb, brand.tenantKey);
       const slots = buildDailySlots(brand, dateText);
 
@@ -322,7 +321,7 @@ async function main() {
     logger.error("test_orchestrator.failed", { error: chunkError(error) });
     process.exitCode = 1;
   } finally {
-    await Promise.allSettled([cpDb.close(), sendyDb.close()]);
+    await cpDb.close();
   }
 }
 
