@@ -26,6 +26,12 @@ function mulberry32(seed) {
   };
 }
 
+function boolEnv(name, fallback = false) {
+  const value = process.env[name];
+  if (value == null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
 function localDateString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: orchestratorConfig.timezone,
@@ -60,12 +66,40 @@ function isSlotDue(slot, now = new Date()) {
   return slotMinutes <= nowMinutes;
 }
 
+function isWeekendDateText(dateText) {
+  const [year, month, day] = String(dateText).split("-").map((part) => Number.parseInt(part, 10));
+  const dayOfWeek = new Date(Date.UTC(year, month - 1, day, 12)).getUTCDay();
+  return dayOfWeek === 0 || dayOfWeek === 6;
+}
+
+function dayTypeForDate(dateText) {
+  return isWeekendDateText(dateText) ? "weekend" : "weekday";
+}
+
+function sendVolumeForDate(dateText) {
+  const dailySends = orchestratorConfig.dailySends || {};
+  const selected = isWeekendDateText(dateText) ? dailySends.weekends : dailySends.weekdays;
+  const fallback = {
+    minPerBrand: dailySends.minPerBrand,
+    maxPerBrand: dailySends.maxPerBrand,
+  };
+  const volume = selected || fallback;
+
+  if (!Number.isInteger(volume.minPerBrand) || !Number.isInteger(volume.maxPerBrand)) {
+    throw new Error(`Invalid dailySends config for ${dayTypeForDate(dateText)}`);
+  }
+  if (volume.minPerBrand < 1 || volume.maxPerBrand < volume.minPerBrand) {
+    throw new Error(`Invalid dailySends range for ${dayTypeForDate(dateText)}`);
+  }
+  return volume;
+}
+
 function buildDailySlots(brand, dateText = localDateString()) {
   const seed = hashInt(`${dateText}:${brand.tenantKey}`);
   const random = mulberry32(seed);
-  const countRange =
-    orchestratorConfig.dailySends.maxPerBrand - orchestratorConfig.dailySends.minPerBrand + 1;
-  const count = orchestratorConfig.dailySends.minPerBrand + Math.floor(random() * countRange);
+  const volume = sendVolumeForDate(dateText);
+  const countRange = volume.maxPerBrand - volume.minPerBrand + 1;
+  const count = volume.minPerBrand + Math.floor(random() * countRange);
 
   const start = orchestratorConfig.sendWindow.startHour * 60;
   const end = orchestratorConfig.sendWindow.endHour * 60;
@@ -454,9 +488,32 @@ function selectedBrands() {
   return orchestratorConfig.brands.filter((brand) => wanted.has(brand.tenantKey));
 }
 
+function previewLimit(defaultLimit) {
+  const value = process.env.TEST_ORCHESTRATOR_PREVIEW_LIMIT || process.env.TEST_ORCHESTRATOR_LIMIT;
+  const parsed = Number.parseInt(value || String(defaultLimit || 1), 10);
+  if (Number.isNaN(parsed) || parsed < 1) return 1;
+  return parsed;
+}
+
+function buildCopyPreviews(planned, limit) {
+  return planned.slice(0, limit).map((item) => ({
+    tenantKey: item.brand.tenantKey,
+    scheduledLocal: slotToTodayDate(item.slot),
+    sendyCampaignId: item.payload.sendyCampaignId,
+    subject: item.copy.subject,
+    plainText: item.copy.plainText,
+    htmlText: item.copy.htmlText,
+    copySource: item.copy.source,
+    copyTopic: item.copy.topic,
+    fromEmail: item.sender.from_email,
+    recipients: item.recipients,
+    due: item.due,
+  }));
+}
+
 async function main() {
   const mode = process.env.TEST_ORCHESTRATOR_MODE || "plan";
-  const forceNow = ["1", "true", "yes"].includes(String(process.env.TEST_ORCHESTRATOR_FORCE_NOW || "").toLowerCase());
+  const forceNow = boolEnv("TEST_ORCHESTRATOR_FORCE_NOW", false);
   const limit = Number.parseInt(process.env.TEST_ORCHESTRATOR_LIMIT || "1", 10);
   const dateText = localDateString();
   const config = loadServiceConfig();
@@ -489,7 +546,10 @@ async function main() {
       mode,
       copyMode: normalizedCopyMode(),
       date: dateText,
+      dayType: dayTypeForDate(dateText),
       timezone: orchestratorConfig.timezone,
+      sendWindow: orchestratorConfig.sendWindow,
+      sendVolume: sendVolumeForDate(dateText),
       slots: planned.map((item) => ({
         tenantKey: item.brand.tenantKey,
         scheduledLocal: slotToTodayDate(item.slot),
@@ -502,6 +562,16 @@ async function main() {
         due: item.due,
       })),
     });
+
+    if (mode === "plan" && boolEnv("TEST_ORCHESTRATOR_PREVIEW_COPY", false)) {
+      logger.info("test_orchestrator.copy_preview", {
+        mode,
+        copyMode: normalizedCopyMode(),
+        date: dateText,
+        dayType: dayTypeForDate(dateText),
+        previews: buildCopyPreviews(planned, previewLimit(limit)),
+      });
+    }
 
     if (mode !== "handoff") return;
 
