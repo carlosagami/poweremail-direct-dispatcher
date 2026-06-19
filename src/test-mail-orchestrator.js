@@ -138,7 +138,7 @@ function buildHtmlFromPlainText(plainText) {
     .trim()
     .split(/\n{2,}/)
     .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>\n")}</p>`)
-    .join("<br>\n");
+    .join("<br><br>\n");
 }
 
 function normalizeHtmlSpacing(htmlText, plainText) {
@@ -146,7 +146,7 @@ function normalizeHtmlSpacing(htmlText, plainText) {
   if (!html) return buildHtmlFromPlainText(plainText);
   if (/<p[\s>]/i.test(html)) {
     return html
-      .replace(/<\/p>\s*<p/gi, "</p><br>\n<p")
+      .replace(/<\/p>\s*<p/gi, "</p><br><br>\n<p")
       .replace(/<\/p>\s*$/i, "</p>");
   }
   return buildHtmlFromPlainText(plainText);
@@ -233,7 +233,7 @@ function copyPrompt(brand, slot, topic, dateText) {
     "El subject debe tener maximo 75 caracteres y sonar natural, no promocional.",
     "El plainText debe tener 70 a 130 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
     "El htmlText debe contener el mismo contenido que plainText en HTML simple.",
-    "En htmlText separa cada parrafo con una linea <br> entre etiquetas </p> y <p>.",
+    "En htmlText separa cada parrafo con dos lineas <br><br> entre etiquetas </p> y <p>.",
     "Datos del envio:",
     JSON.stringify({
       tenantKey: brand.tenantKey,
@@ -439,7 +439,9 @@ async function loadBaseSender(cpDb, tenantKey) {
 }
 
 function buildSyntheticCampaignId(slot) {
-  return 800000000 + (hashInt(slot.slotId) % 100000000);
+  const idSalt = String(process.env.TEST_ORCHESTRATOR_ID_SALT || "").trim();
+  const idSource = idSalt ? slot.slotId + ":" + idSalt : slot.slotId;
+  return 800000000 + (hashInt(idSource) % 100000000);
 }
 
 function buildHandoffPayload(brand, slot, sender, copy, recipients) {
