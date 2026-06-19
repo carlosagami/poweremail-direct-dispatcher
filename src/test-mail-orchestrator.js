@@ -7,6 +7,11 @@ const logger = require("./logger");
 const { chunkError } = require("./utils");
 const orchestratorConfig = require("../config/test-orchestrator");
 
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+const COPY_MODES = new Set(["auto", "ai", "local"]);
+const EMAIL_ADDRESS_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+
 function hashInt(input) {
   const digest = crypto.createHash("sha256").update(String(input)).digest();
   return digest.readUInt32BE(0);
@@ -19,6 +24,12 @@ function mulberry32(seed) {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+function boolEnv(name, fallback = false) {
+  const value = process.env[name];
+  if (value == null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
 function localDateString(date = new Date()) {
@@ -55,12 +66,40 @@ function isSlotDue(slot, now = new Date()) {
   return slotMinutes <= nowMinutes;
 }
 
+function isWeekendDateText(dateText) {
+  const [year, month, day] = String(dateText).split("-").map((part) => Number.parseInt(part, 10));
+  const dayOfWeek = new Date(Date.UTC(year, month - 1, day, 12)).getUTCDay();
+  return dayOfWeek === 0 || dayOfWeek === 6;
+}
+
+function dayTypeForDate(dateText) {
+  return isWeekendDateText(dateText) ? "weekend" : "weekday";
+}
+
+function sendVolumeForDate(dateText) {
+  const dailySends = orchestratorConfig.dailySends || {};
+  const selected = isWeekendDateText(dateText) ? dailySends.weekends : dailySends.weekdays;
+  const fallback = {
+    minPerBrand: dailySends.minPerBrand,
+    maxPerBrand: dailySends.maxPerBrand,
+  };
+  const volume = selected || fallback;
+
+  if (!Number.isInteger(volume.minPerBrand) || !Number.isInteger(volume.maxPerBrand)) {
+    throw new Error(`Invalid dailySends config for ${dayTypeForDate(dateText)}`);
+  }
+  if (volume.minPerBrand < 1 || volume.maxPerBrand < volume.minPerBrand) {
+    throw new Error(`Invalid dailySends range for ${dayTypeForDate(dateText)}`);
+  }
+  return volume;
+}
+
 function buildDailySlots(brand, dateText = localDateString()) {
   const seed = hashInt(`${dateText}:${brand.tenantKey}`);
   const random = mulberry32(seed);
-  const countRange =
-    orchestratorConfig.dailySends.maxPerBrand - orchestratorConfig.dailySends.minPerBrand + 1;
-  const count = orchestratorConfig.dailySends.minPerBrand + Math.floor(random() * countRange);
+  const volume = sendVolumeForDate(dateText);
+  const countRange = volume.maxPerBrand - volume.minPerBrand + 1;
+  const count = volume.minPerBrand + Math.floor(random() * countRange);
 
   const start = orchestratorConfig.sendWindow.startHour * 60;
   const end = orchestratorConfig.sendWindow.endHour * 60;
@@ -87,7 +126,33 @@ function topicForSlot(brand, slot) {
   return brand.topics[index];
 }
 
-function buildCopy(brand, slot) {
+function buildHtmlFromPlainText(plainText) {
+  const escapeHtml = (value) =>
+    String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  return String(plainText)
+    .trim()
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>\n")}</p>`)
+    .join("<br>\n");
+}
+
+function normalizeHtmlSpacing(htmlText, plainText) {
+  const html = String(htmlText || "").trim();
+  if (!html) return buildHtmlFromPlainText(plainText);
+  if (/<p[\s>]/i.test(html)) {
+    return html
+      .replace(/<\/p>\s*<p/gi, "</p><br>\n<p")
+      .replace(/<\/p>\s*$/i, "</p>");
+  }
+  return buildHtmlFromPlainText(plainText);
+}
+
+function buildLocalCopy(brand, slot) {
   const topic = topicForSlot(brand, slot);
   const subjectMap = {
     colonyspaces: `Seguimiento sobre ${topic}`,
@@ -116,7 +181,198 @@ function buildCopy(brand, slot) {
     brand.brandName,
   ].join("\n");
 
-  return { subject, plainText: body, htmlText: body.replace(/\n/g, "<br>\n") };
+  return {
+    subject,
+    plainText: body,
+    htmlText: buildHtmlFromPlainText(body),
+    topic,
+    source: "local",
+  };
+}
+
+function normalizedCopyMode() {
+  const mode = String(process.env.TEST_ORCHESTRATOR_COPY_MODE || "auto").trim().toLowerCase();
+  if (!COPY_MODES.has(mode)) {
+    throw new Error(`Invalid TEST_ORCHESTRATOR_COPY_MODE=${mode}; expected auto, ai, or local`);
+  }
+  return mode;
+}
+
+function shouldUseAiCopy(mode) {
+  if (mode === "local") return false;
+  if (mode === "ai") return true;
+  return Boolean(process.env.OPENAI_API_KEY);
+}
+
+function openAiModel() {
+  return process.env.TEST_ORCHESTRATOR_OPENAI_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini";
+}
+
+function copyTemperature() {
+  const value = process.env.TEST_ORCHESTRATOR_COPY_TEMPERATURE;
+  if (!value) return 0.85;
+  const parsed = Number.parseFloat(value);
+  if (Number.isNaN(parsed) || parsed < 0 || parsed > 2) {
+    throw new Error(`Invalid TEST_ORCHESTRATOR_COPY_TEMPERATURE=${value}`);
+  }
+  return parsed;
+}
+
+function copyPrompt(brand, slot, topic, dateText) {
+  return [
+    "Genera un correo outbound breve en espanol neutro/latam.",
+    "Responde exclusivamente JSON valido con estas llaves: subject, plainText, htmlText.",
+    "No uses markdown. No incluyas explicaciones.",
+    "El correo debe sonar humano, especifico y contextual a la marca que envia.",
+    "No debe sonar a brochure, pitch comercial ni plantilla generica.",
+    "Usa una observacion concreta del contexto del negocio y luego una pregunta o siguiente paso suave.",
+    "Evita estas frases y construcciones: 'queria contarte', 'contamos con', 'te ofrecemos', 'tenemos la solucion', 'te gustaria saber mas', 'agenda una llamada', 'descubre', 'potencia', 'ideal para'.",
+    "No prometas descuentos, resultados garantizados, urgencias falsas ni claims medicos.",
+    "No menciones que fue generado por IA.",
+    "JAMAS incluyas una direccion de correo electronico en subject, plainText o htmlText.",
+    "El subject debe tener maximo 75 caracteres y sonar natural, no promocional.",
+    "El plainText debe tener 70 a 130 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
+    "El htmlText debe contener el mismo contenido que plainText en HTML simple.",
+    "En htmlText separa cada parrafo con una linea <br> entre etiquetas </p> y <p>.",
+    "Datos del envio:",
+    JSON.stringify({
+      tenantKey: brand.tenantKey,
+      brandName: brand.brandName,
+      senderPersona: brand.senderPersona,
+      senderDisplayName: brand.senderDisplayName,
+      businessDomain: brand.businessDomain,
+      topic,
+      date: dateText,
+      slotId: slot.slotId,
+      slotIndex: slot.slotIndex,
+      scheduledLocal: slotToTodayDate(slot),
+      availableTopics: brand.topics,
+    }),
+  ].join("\n");
+}
+
+function extractResponseText(body) {
+  if (typeof body.output_text === "string") return body.output_text;
+  if (Array.isArray(body.output)) {
+    for (const item of body.output) {
+      if (!Array.isArray(item.content)) continue;
+      for (const content of item.content) {
+        if (typeof content.text === "string") return content.text;
+      }
+    }
+  }
+  if (Array.isArray(body.choices) && body.choices[0]?.message?.content) {
+    return body.choices[0].message.content;
+  }
+  return "";
+}
+
+async function callOpenAi(prompt) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY for AI copy generation");
+
+  const model = openAiModel();
+  const temperature = copyTemperature();
+  const useResponsesApi = ["1", "true", "yes"].includes(
+    String(process.env.TEST_ORCHESTRATOR_USE_RESPONSES_API || "").toLowerCase()
+  );
+
+  const payload = useResponsesApi
+    ? {
+        model,
+        temperature,
+        input: prompt,
+      }
+    : {
+        model,
+        temperature,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        response_format: {
+          type: "json_object",
+        },
+      };
+
+  const response = await fetch(useResponsesApi ? OPENAI_RESPONSES_URL : OPENAI_CHAT_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let body = text;
+  try {
+    body = JSON.parse(text);
+  } catch (_) {}
+
+  if (!response.ok) {
+    const message = typeof body === "object" ? JSON.stringify(body) : String(body);
+    throw new Error(`OpenAI copy generation failed status=${response.status} body=${message}`);
+  }
+
+  const generated = extractResponseText(body);
+  if (!generated) throw new Error("OpenAI response did not include generated text");
+  return JSON.parse(generated);
+}
+
+function containsEmailAddress(value) {
+  return EMAIL_ADDRESS_PATTERN.test(String(value || ""));
+}
+
+function assertCopyHasNoEmailAddress(subject, plainText, htmlText) {
+  if (
+    containsEmailAddress(subject) ||
+    containsEmailAddress(plainText) ||
+    containsEmailAddress(htmlText)
+  ) {
+    throw new Error("Generated copy contains a visible email address");
+  }
+}
+
+function normalizeAiCopy(candidate, fallback) {
+  const subject = String(candidate.subject || "").trim();
+  const plainText = String(candidate.plainText || candidate.plain_text || "").trim();
+  const htmlText = normalizeHtmlSpacing(candidate.htmlText || candidate.html_text, plainText);
+
+  if (!subject || !plainText || !htmlText) {
+    throw new Error("AI copy is missing subject, plainText, or htmlText");
+  }
+  assertCopyHasNoEmailAddress(subject, plainText, htmlText);
+
+  return {
+    ...fallback,
+    subject: subject.slice(0, 90),
+    plainText,
+    htmlText,
+    source: "ai",
+  };
+}
+
+async function buildCopy(brand, slot, dateText) {
+  const fallback = buildLocalCopy(brand, slot);
+  const mode = normalizedCopyMode();
+  if (!shouldUseAiCopy(mode)) return fallback;
+
+  try {
+    const prompt = copyPrompt(brand, slot, fallback.topic, dateText);
+    const generated = await callOpenAi(prompt);
+    return normalizeAiCopy(generated, fallback);
+  } catch (error) {
+    if (mode === "ai") throw error;
+    logger.warn("test_orchestrator.ai_copy_fallback", {
+      tenantKey: brand.tenantKey,
+      slotId: slot.slotId,
+      error: chunkError(error),
+    });
+    return fallback;
+  }
 }
 
 async function loadActiveRecipients(cpDb, tenantKey, listId) {
@@ -217,6 +473,8 @@ function buildHandoffPayload(brand, slot, sender, copy, recipients) {
         scheduled_for_local: slotToTodayDate(slot),
         sendy_test_list_id: brand.sendyTestListId,
         mirrors_enabled: orchestratorConfig.dispatch.mirrorsEnabled,
+        copy_source: copy.source,
+        copy_topic: copy.topic,
       },
     },
     recipients,
@@ -259,9 +517,32 @@ function selectedBrands() {
   return orchestratorConfig.brands.filter((brand) => wanted.has(brand.tenantKey));
 }
 
+function previewLimit(defaultLimit) {
+  const value = process.env.TEST_ORCHESTRATOR_PREVIEW_LIMIT || process.env.TEST_ORCHESTRATOR_LIMIT;
+  const parsed = Number.parseInt(value || String(defaultLimit || 1), 10);
+  if (Number.isNaN(parsed) || parsed < 1) return 1;
+  return parsed;
+}
+
+function buildCopyPreviews(planned, limit) {
+  return planned.slice(0, limit).map((item) => ({
+    tenantKey: item.brand.tenantKey,
+    scheduledLocal: slotToTodayDate(item.slot),
+    sendyCampaignId: item.payload.sendyCampaignId,
+    subject: item.copy.subject,
+    plainText: item.copy.plainText,
+    htmlText: item.copy.htmlText,
+    copySource: item.copy.source,
+    copyTopic: item.copy.topic,
+    fromEmail: item.sender.from_email,
+    recipients: item.recipients,
+    due: item.due,
+  }));
+}
+
 async function main() {
   const mode = process.env.TEST_ORCHESTRATOR_MODE || "plan";
-  const forceNow = ["1", "true", "yes"].includes(String(process.env.TEST_ORCHESTRATOR_FORCE_NOW || "").toLowerCase());
+  const forceNow = boolEnv("TEST_ORCHESTRATOR_FORCE_NOW", false);
   const limit = Number.parseInt(process.env.TEST_ORCHESTRATOR_LIMIT || "1", 10);
   const dateText = localDateString();
   const config = loadServiceConfig();
@@ -276,7 +557,7 @@ async function main() {
       const slots = buildDailySlots(brand, dateText);
 
       for (const slot of slots) {
-        const copy = buildCopy(brand, slot);
+        const copy = await buildCopy(brand, slot, dateText);
         const payload = buildHandoffPayload(brand, slot, sender, copy, recipients);
         planned.push({
           brand,
@@ -292,18 +573,34 @@ async function main() {
 
     logger.info("test_orchestrator.plan", {
       mode,
+      copyMode: normalizedCopyMode(),
       date: dateText,
+      dayType: dayTypeForDate(dateText),
       timezone: orchestratorConfig.timezone,
+      sendWindow: orchestratorConfig.sendWindow,
+      sendVolume: sendVolumeForDate(dateText),
       slots: planned.map((item) => ({
         tenantKey: item.brand.tenantKey,
         scheduledLocal: slotToTodayDate(item.slot),
         sendyCampaignId: item.payload.sendyCampaignId,
         subject: item.copy.subject,
+        copySource: item.copy.source,
+        copyTopic: item.copy.topic,
         fromEmail: item.sender.from_email,
         recipients: item.recipients,
         due: item.due,
       })),
     });
+
+    if (mode === "plan" && boolEnv("TEST_ORCHESTRATOR_PREVIEW_COPY", false)) {
+      logger.info("test_orchestrator.copy_preview", {
+        mode,
+        copyMode: normalizedCopyMode(),
+        date: dateText,
+        dayType: dayTypeForDate(dateText),
+        previews: buildCopyPreviews(planned, previewLimit(limit)),
+      });
+    }
 
     if (mode !== "handoff") return;
 
@@ -314,6 +611,8 @@ async function main() {
         tenantKey: item.brand.tenantKey,
         sendyCampaignId: item.payload.sendyCampaignId,
         scheduledLocal: slotToTodayDate(item.slot),
+        copySource: item.copy.source,
+        copyTopic: item.copy.topic,
         result,
       });
     }
