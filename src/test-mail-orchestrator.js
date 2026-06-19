@@ -7,6 +7,10 @@ const logger = require("./logger");
 const { chunkError } = require("./utils");
 const orchestratorConfig = require("../config/test-orchestrator");
 
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+const COPY_MODES = new Set(["auto", "ai", "local"]);
+
 function hashInt(input) {
   const digest = crypto.createHash("sha256").update(String(input)).digest();
   return digest.readUInt32BE(0);
@@ -87,7 +91,7 @@ function topicForSlot(brand, slot) {
   return brand.topics[index];
 }
 
-function buildCopy(brand, slot) {
+function buildLocalCopy(brand, slot) {
   const topic = topicForSlot(brand, slot);
   const subjectMap = {
     colonyspaces: `Seguimiento sobre ${topic}`,
@@ -116,7 +120,184 @@ function buildCopy(brand, slot) {
     brand.brandName,
   ].join("\n");
 
-  return { subject, plainText: body, htmlText: body.replace(/\n/g, "<br>\n") };
+  return {
+    subject,
+    plainText: body,
+    htmlText: body.replace(/\n/g, "<br>\n"),
+    topic,
+    source: "local",
+  };
+}
+
+function normalizedCopyMode() {
+  const mode = String(process.env.TEST_ORCHESTRATOR_COPY_MODE || "auto").trim().toLowerCase();
+  if (!COPY_MODES.has(mode)) {
+    throw new Error(`Invalid TEST_ORCHESTRATOR_COPY_MODE=${mode}; expected auto, ai, or local`);
+  }
+  return mode;
+}
+
+function shouldUseAiCopy(mode) {
+  if (mode === "local") return false;
+  if (mode === "ai") return true;
+  return Boolean(process.env.OPENAI_API_KEY);
+}
+
+function openAiModel() {
+  return process.env.TEST_ORCHESTRATOR_OPENAI_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini";
+}
+
+function copyTemperature() {
+  const value = process.env.TEST_ORCHESTRATOR_COPY_TEMPERATURE;
+  if (!value) return 0.85;
+  const parsed = Number.parseFloat(value);
+  if (Number.isNaN(parsed) || parsed < 0 || parsed > 2) {
+    throw new Error(`Invalid TEST_ORCHESTRATOR_COPY_TEMPERATURE=${value}`);
+  }
+  return parsed;
+}
+
+function copyPrompt(brand, slot, topic, dateText) {
+  return [
+    "Genera un correo outbound breve en espanol neutro/latam.",
+    "Responde exclusivamente JSON valido con estas llaves: subject, plainText, htmlText.",
+    "No uses markdown. No incluyas explicaciones.",
+    "El correo debe sonar humano, concreto y distinto a una plantilla generica.",
+    "Debe reflejar el contexto de la marca que envia y el tema del slot.",
+    "No prometas descuentos, resultados garantizados, urgencias falsas ni claims medicos.",
+    "No menciones que fue generado por IA.",
+    "El subject debe tener maximo 75 caracteres.",
+    "El plainText debe tener 80 a 150 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
+    "El htmlText debe ser el mismo contenido en HTML simple con parrafos y sin estilos inline.",
+    "Datos del envio:",
+    JSON.stringify({
+      tenantKey: brand.tenantKey,
+      brandName: brand.brandName,
+      senderPersona: brand.senderPersona,
+      senderDisplayName: brand.senderDisplayName,
+      businessDomain: brand.businessDomain,
+      topic,
+      date: dateText,
+      slotId: slot.slotId,
+      slotIndex: slot.slotIndex,
+      scheduledLocal: slotToTodayDate(slot),
+      availableTopics: brand.topics,
+    }),
+  ].join("\n");
+}
+
+function extractResponseText(body) {
+  if (typeof body.output_text === "string") return body.output_text;
+  if (Array.isArray(body.output)) {
+    for (const item of body.output) {
+      if (!Array.isArray(item.content)) continue;
+      for (const content of item.content) {
+        if (typeof content.text === "string") return content.text;
+      }
+    }
+  }
+  if (Array.isArray(body.choices) && body.choices[0]?.message?.content) {
+    return body.choices[0].message.content;
+  }
+  return "";
+}
+
+async function callOpenAi(prompt) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY for AI copy generation");
+
+  const model = openAiModel();
+  const temperature = copyTemperature();
+  const useResponsesApi = !["0", "false", "no"].includes(
+    String(process.env.TEST_ORCHESTRATOR_USE_RESPONSES_API || "true").toLowerCase()
+  );
+
+  const payload = useResponsesApi
+    ? {
+        model,
+        temperature,
+        input: prompt,
+        text: {
+          format: {
+            type: "json_object",
+          },
+        },
+      }
+    : {
+        model,
+        temperature,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        response_format: {
+          type: "json_object",
+        },
+      };
+
+  const response = await fetch(useResponsesApi ? OPENAI_RESPONSES_URL : OPENAI_CHAT_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let body = text;
+  try {
+    body = JSON.parse(text);
+  } catch (_) {}
+
+  if (!response.ok) {
+    const message = typeof body === "object" ? JSON.stringify(body) : String(body);
+    throw new Error(`OpenAI copy generation failed status=${response.status} body=${message}`);
+  }
+
+  const generated = extractResponseText(body);
+  if (!generated) throw new Error("OpenAI response did not include generated text");
+  return JSON.parse(generated);
+}
+
+function normalizeAiCopy(candidate, fallback) {
+  const subject = String(candidate.subject || "").trim();
+  const plainText = String(candidate.plainText || candidate.plain_text || "").trim();
+  const htmlText = String(candidate.htmlText || candidate.html_text || "").trim();
+
+  if (!subject || !plainText || !htmlText) {
+    throw new Error("AI copy is missing subject, plainText, or htmlText");
+  }
+
+  return {
+    ...fallback,
+    subject: subject.slice(0, 90),
+    plainText,
+    htmlText,
+    source: "ai",
+  };
+}
+
+async function buildCopy(brand, slot, dateText) {
+  const fallback = buildLocalCopy(brand, slot);
+  const mode = normalizedCopyMode();
+  if (!shouldUseAiCopy(mode)) return fallback;
+
+  try {
+    const prompt = copyPrompt(brand, slot, fallback.topic, dateText);
+    const generated = await callOpenAi(prompt);
+    return normalizeAiCopy(generated, fallback);
+  } catch (error) {
+    if (mode === "ai") throw error;
+    logger.warn("test_orchestrator.ai_copy_fallback", {
+      tenantKey: brand.tenantKey,
+      slotId: slot.slotId,
+      error: chunkError(error),
+    });
+    return fallback;
+  }
 }
 
 async function loadActiveRecipients(cpDb, tenantKey, listId) {
@@ -217,6 +398,8 @@ function buildHandoffPayload(brand, slot, sender, copy, recipients) {
         scheduled_for_local: slotToTodayDate(slot),
         sendy_test_list_id: brand.sendyTestListId,
         mirrors_enabled: orchestratorConfig.dispatch.mirrorsEnabled,
+        copy_source: copy.source,
+        copy_topic: copy.topic,
       },
     },
     recipients,
@@ -276,7 +459,7 @@ async function main() {
       const slots = buildDailySlots(brand, dateText);
 
       for (const slot of slots) {
-        const copy = buildCopy(brand, slot);
+        const copy = await buildCopy(brand, slot, dateText);
         const payload = buildHandoffPayload(brand, slot, sender, copy, recipients);
         planned.push({
           brand,
@@ -292,6 +475,7 @@ async function main() {
 
     logger.info("test_orchestrator.plan", {
       mode,
+      copyMode: normalizedCopyMode(),
       date: dateText,
       timezone: orchestratorConfig.timezone,
       slots: planned.map((item) => ({
@@ -299,6 +483,8 @@ async function main() {
         scheduledLocal: slotToTodayDate(item.slot),
         sendyCampaignId: item.payload.sendyCampaignId,
         subject: item.copy.subject,
+        copySource: item.copy.source,
+        copyTopic: item.copy.topic,
         fromEmail: item.sender.from_email,
         recipients: item.recipients,
         due: item.due,
@@ -314,6 +500,8 @@ async function main() {
         tenantKey: item.brand.tenantKey,
         sendyCampaignId: item.payload.sendyCampaignId,
         scheduledLocal: slotToTodayDate(item.slot),
+        copySource: item.copy.source,
+        copyTopic: item.copy.topic,
         result,
       });
     }
