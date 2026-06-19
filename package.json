@@ -10,11 +10,13 @@
     "plan-batches": "node src/batch-planner.js",
     "execute": "node src/relay-executor.js",
     "prepare-dispatch": "node src/prepare-dispatch-run.js",
+    "orchestrate:test": "node src/test-mail-orchestrator.js",
     "check:intake": "node --check src/campaign-intake.js",
     "check:prepare": "node --check src/prepare-dispatch-run.js",
     "check:resolve": "node --check src/audience-resolver.js",
     "check:plan": "node --check src/batch-planner.js",
     "check:execute": "node --check src/relay-executor.js",
+    "check:orchestrate-test": "node --check src/test-mail-orchestrator.js",
     "start": "node -r ./src/worker-loop.js src/server.js"
   },
   "dependencies": {
