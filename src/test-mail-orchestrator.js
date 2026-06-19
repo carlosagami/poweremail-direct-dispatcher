@@ -208,8 +208,8 @@ async function callOpenAi(prompt) {
 
   const model = openAiModel();
   const temperature = copyTemperature();
-  const useResponsesApi = !["0", "false", "no"].includes(
-    String(process.env.TEST_ORCHESTRATOR_USE_RESPONSES_API || "true").toLowerCase()
+  const useResponsesApi = ["1", "true", "yes"].includes(
+    String(process.env.TEST_ORCHESTRATOR_USE_RESPONSES_API || "").toLowerCase()
   );
 
   const payload = useResponsesApi
@@ -217,11 +217,6 @@ async function callOpenAi(prompt) {
         model,
         temperature,
         input: prompt,
-        text: {
-          format: {
-            type: "json_object",
-          },
-        },
       }
     : {
         model,
