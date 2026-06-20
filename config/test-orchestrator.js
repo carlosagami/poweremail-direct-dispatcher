@@ -12,8 +12,8 @@ module.exports = {
       maxPerBrand: 7,
     },
     weekends: {
-      minPerBrand: 1,
-      maxPerBrand: 3,
+      minPerBrand: 3,
+      maxPerBrand: 5,
     },
   },
   intervalJitter: {
