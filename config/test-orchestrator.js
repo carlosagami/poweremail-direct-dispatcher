@@ -16,6 +16,11 @@ module.exports = {
       maxPerBrand: 5,
     },
   },
+  recipientCohorts: {
+    enabled: true,
+    minRecipientsPerSlot: 3,
+    maxRecipientsPerSlot: 5,
+  },
   intervalJitter: {
     minHours: 2,
     maxHours: 5,
