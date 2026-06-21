@@ -79,6 +79,16 @@ function isSlotDue(slot, now = new Date(), lookbackMinutes = null) {
   return nowMinutes - slotMinutes <= lookbackMinutes;
 }
 
+function slotMinuteOfDay(slot) {
+  return slot.hour * 60 + slot.minute;
+}
+
+function comparePlannedBySlot(a, b) {
+  const minuteDiff = slotMinuteOfDay(a.slot) - slotMinuteOfDay(b.slot);
+  if (minuteDiff !== 0) return minuteDiff;
+  return a.brand.tenantKey.localeCompare(b.brand.tenantKey);
+}
+
 function isWeekendDateText(dateText) {
   const [year, month, day] = String(dateText).split("-").map((part) => Number.parseInt(part, 10));
   const dayOfWeek = new Date(Date.UTC(year, month - 1, day, 12)).getUTCDay();
@@ -587,6 +597,8 @@ async function main() {
         });
       }
     }
+
+    planned.sort(comparePlannedBySlot);
 
     logger.info("test_orchestrator.plan", {
       mode,
