@@ -32,6 +32,16 @@ function boolEnv(name, fallback = false) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
+function optionalPositiveIntEnv(name) {
+  const value = process.env[name];
+  if (value == null || value === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new Error(`Invalid ${name}=${value}; expected a positive integer or 0`);
+  }
+  return parsed;
+}
+
 function localDateString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: orchestratorConfig.timezone,
@@ -59,11 +69,14 @@ function slotToTodayDate(slot) {
   return `${date}T${String(slot.hour).padStart(2, "0")}:${String(slot.minute).padStart(2, "0")}:00`;
 }
 
-function isSlotDue(slot, now = new Date()) {
+function isSlotDue(slot, now = new Date(), lookbackMinutes = null) {
   const parts = localDateTimeParts(now);
   const nowMinutes = Number(parts.hour) * 60 + Number(parts.minute);
   const slotMinutes = slot.hour * 60 + slot.minute;
-  return slotMinutes <= nowMinutes;
+
+  if (slotMinutes > nowMinutes) return false;
+  if (lookbackMinutes == null) return true;
+  return nowMinutes - slotMinutes <= lookbackMinutes;
 }
 
 function isWeekendDateText(dateText) {
@@ -545,8 +558,10 @@ function buildCopyPreviews(planned, limit) {
 async function main() {
   const mode = process.env.TEST_ORCHESTRATOR_MODE || "plan";
   const forceNow = boolEnv("TEST_ORCHESTRATOR_FORCE_NOW", false);
+  const dueLookbackMinutes = optionalPositiveIntEnv("TEST_ORCHESTRATOR_DUE_LOOKBACK_MINUTES");
   const limit = Number.parseInt(process.env.TEST_ORCHESTRATOR_LIMIT || "1", 10);
-  const dateText = localDateString();
+  const now = new Date();
+  const dateText = localDateString(now);
   const config = loadServiceConfig();
   const cpDb = createControlPlaneDb(config);
 
@@ -568,7 +583,7 @@ async function main() {
           copy,
           payload,
           recipients: recipients.length,
-          due: forceNow || isSlotDue(slot),
+          due: forceNow || isSlotDue(slot, now, dueLookbackMinutes),
         });
       }
     }
@@ -576,6 +591,8 @@ async function main() {
     logger.info("test_orchestrator.plan", {
       mode,
       copyMode: normalizedCopyMode(),
+      forceNow,
+      dueLookbackMinutes,
       date: dateText,
       dayType: dayTypeForDate(dateText),
       timezone: orchestratorConfig.timezone,
