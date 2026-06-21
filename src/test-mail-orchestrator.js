@@ -588,6 +588,20 @@ async function postHandoff(payload) {
 
   if (!response.ok) {
     const message = typeof body === "object" ? JSON.stringify(body) : String(body);
+    const alreadyCompletedConflict =
+      response.status === 409 &&
+      /alreadyCompleted|already completed|already exists|duplicate/i.test(message);
+
+    if (alreadyCompletedConflict) {
+      return {
+        ok: true,
+        skipped: true,
+        alreadyCompleted: true,
+        status: response.status,
+        body,
+      };
+    }
+
     throw new Error(`handoff failed status=${response.status} body=${message}`);
   }
 
