@@ -42,6 +42,13 @@ function optionalPositiveIntEnv(name) {
   return parsed;
 }
 
+function intEnvOrConfig(envName, configValue, fallback) {
+  const envValue = optionalPositiveIntEnv(envName);
+  if (envValue != null) return envValue;
+  if (Number.isInteger(configValue)) return configValue;
+  return fallback;
+}
+
 function localDateString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: orchestratorConfig.timezone,
@@ -87,6 +94,58 @@ function comparePlannedBySlot(a, b) {
   const minuteDiff = slotMinuteOfDay(a.slot) - slotMinuteOfDay(b.slot);
   if (minuteDiff !== 0) return minuteDiff;
   return a.brand.tenantKey.localeCompare(b.brand.tenantKey);
+}
+
+function recipientCohortConfig() {
+  const config = orchestratorConfig.recipientCohorts || {};
+  const minRecipientsPerSlot = intEnvOrConfig(
+    "TEST_ORCHESTRATOR_RECIPIENTS_PER_SLOT_MIN",
+    config.minRecipientsPerSlot,
+    3
+  );
+  const maxRecipientsPerSlot = intEnvOrConfig(
+    "TEST_ORCHESTRATOR_RECIPIENTS_PER_SLOT_MAX",
+    config.maxRecipientsPerSlot,
+    5
+  );
+
+  if (minRecipientsPerSlot < 1 || maxRecipientsPerSlot < minRecipientsPerSlot) {
+    throw new Error("Invalid recipient cohort size config");
+  }
+
+  return {
+    enabled: boolEnv("TEST_ORCHESTRATOR_RECIPIENT_COHORTS_ENABLED", config.enabled !== false),
+    minRecipientsPerSlot,
+    maxRecipientsPerSlot,
+  };
+}
+
+function selectRecipientsForSlot(recipients, brand, slot, dateText) {
+  const config = recipientCohortConfig();
+  if (!config.enabled || recipients.length <= config.maxRecipientsPerSlot) {
+    return recipients;
+  }
+
+  const range = config.maxRecipientsPerSlot - config.minRecipientsPerSlot + 1;
+  const count = Math.min(
+    recipients.length,
+    config.minRecipientsPerSlot + (hashInt(`${slot.slotId}:recipient-count`) % range)
+  );
+
+  const ordered = [...recipients].sort((a, b) => {
+    const aKey = `${dateText}:${brand.tenantKey}:recipient:${String(a.email || "")}`;
+    const bKey = `${dateText}:${brand.tenantKey}:recipient:${String(b.email || "")}`;
+    const diff = hashInt(aKey) - hashInt(bKey);
+    if (diff !== 0) return diff;
+    return String(a.email || "").localeCompare(String(b.email || ""));
+  });
+
+  const start = ((slot.slotIndex - 1) * config.maxRecipientsPerSlot) % ordered.length;
+  const selected = [];
+  for (let i = 0; i < count; i += 1) {
+    selected.push(ordered[(start + i) % ordered.length]);
+  }
+  return selected;
 }
 
 function isWeekendDateText(dateText) {
@@ -561,6 +620,7 @@ function buildCopyPreviews(planned, limit) {
     copyTopic: item.copy.topic,
     fromEmail: item.sender.from_email,
     recipients: item.recipients,
+    totalRecipients: item.totalRecipients,
     due: item.due,
   }));
 }
@@ -577,13 +637,15 @@ async function main() {
 
   try {
     const planned = [];
+    const cohortConfig = recipientCohortConfig();
 
     for (const brand of selectedBrands()) {
-      const recipients = await loadActiveRecipients(cpDb, brand.tenantKey, brand.sendyTestListId);
+      const allRecipients = await loadActiveRecipients(cpDb, brand.tenantKey, brand.sendyTestListId);
       const sender = await loadBaseSender(cpDb, brand.tenantKey);
       const slots = buildDailySlots(brand, dateText);
 
       for (const slot of slots) {
+        const recipients = selectRecipientsForSlot(allRecipients, brand, slot, dateText);
         const copy = await buildCopy(brand, slot, dateText);
         const payload = buildHandoffPayload(brand, slot, sender, copy, recipients);
         planned.push({
@@ -593,6 +655,7 @@ async function main() {
           copy,
           payload,
           recipients: recipients.length,
+          totalRecipients: allRecipients.length,
           due: forceNow || isSlotDue(slot, now, dueLookbackMinutes),
         });
       }
@@ -605,6 +668,7 @@ async function main() {
       copyMode: normalizedCopyMode(),
       forceNow,
       dueLookbackMinutes,
+      recipientCohorts: cohortConfig,
       date: dateText,
       dayType: dayTypeForDate(dateText),
       timezone: orchestratorConfig.timezone,
@@ -619,6 +683,7 @@ async function main() {
         copyTopic: item.copy.topic,
         fromEmail: item.sender.from_email,
         recipients: item.recipients,
+        totalRecipients: item.totalRecipients,
         due: item.due,
       })),
     });
@@ -644,6 +709,8 @@ async function main() {
         scheduledLocal: slotToTodayDate(item.slot),
         copySource: item.copy.source,
         copyTopic: item.copy.topic,
+        recipients: item.recipients,
+        totalRecipients: item.totalRecipients,
         result,
       });
     }
