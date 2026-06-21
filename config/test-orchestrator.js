@@ -32,7 +32,7 @@ module.exports = {
       sendyAppName: "Colony Spaces",
       sendyTestListId: 49,
       senderPersona: "Eduardo Saba",
-      senderDisplayName: "Eduardo de Colony Spaces",
+      senderDisplayName: "Eduardo Saba",
       businessDomain: "coworking, oficinas flexibles, salas de juntas y espacios para equipos",
       topics: [
         "reuniones de equipo",
@@ -47,8 +47,8 @@ module.exports = {
       brandName: "Deco-Simil",
       sendyAppName: "Deco-Simíl",
       sendyTestListId: 50,
-      senderPersona: "Andres Itzkowich",
-      senderDisplayName: "Andres de Deco-Simil",
+      senderPersona: "Andrés Itzkowich",
+      senderDisplayName: "Andrés Itzkowich",
       businessDomain: "telas, papel tapiz, viniles y materiales decorativos",
       topics: [
         "seleccion de materiales",
