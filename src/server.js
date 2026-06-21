@@ -1,6 +1,7 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const { loadServiceConfig } = require("./config");
 const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
@@ -116,6 +117,71 @@ function withPowerEmailSenderOverride(recipient, fromEmail, replyTo, senderBucke
       __poweremail_sender_bucket: senderBucket,
     },
   };
+}
+
+function hashInt(input) {
+  const digest = crypto.createHash("sha256").update(String(input)).digest();
+  return digest.readUInt32BE(0);
+}
+
+function normalizedRecipientEmail(recipient) {
+  return String(recipient.email || "").trim().toLowerCase();
+}
+
+function campaignSourceJson(campaign) {
+  const sourceJson = campaign.source_json || campaign.sourceJson || {};
+  return sourceJson && typeof sourceJson === "object" && !Array.isArray(sourceJson) ? sourceJson : {};
+}
+
+function isTestAutomationCampaign(campaign) {
+  return campaignSourceJson(campaign).source_system === "poweremail-test-automation";
+}
+
+function splitRecipientsForTestMirrors(recipients, campaign, sendyCampaignId) {
+  if (!isTestAutomationCampaign(campaign) || recipients.length < 2) {
+    return {
+      parentRecipients: recipients,
+      mirrorRecipients: recipients,
+      splitApplied: false,
+    };
+  }
+
+  const sourceJson = campaignSourceJson(campaign);
+  const splitKey = sourceJson.slot_id || sourceJson.scheduled_for_local || sendyCampaignId;
+
+  const ordered = [...recipients].sort((a, b) => {
+    const aEmail = normalizedRecipientEmail(a);
+    const bEmail = normalizedRecipientEmail(b);
+    const diff = hashInt(`${splitKey}:mirror-split:${aEmail}`) - hashInt(`${splitKey}:mirror-split:${bEmail}`);
+    if (diff !== 0) return diff;
+    return aEmail.localeCompare(bEmail);
+  });
+
+  const parentRecipients = [];
+  const mirrorRecipients = [];
+
+  for (const [index, recipient] of ordered.entries()) {
+    if (index % 2 === 0) {
+      parentRecipients.push(recipient);
+    } else {
+      mirrorRecipients.push(recipient);
+    }
+  }
+
+  return {
+    parentRecipients,
+    mirrorRecipients,
+    splitApplied: true,
+  };
+}
+
+function addGroupRecipientEmails(target, groups) {
+  for (const group of groups) {
+    for (const recipient of group.recipients || []) {
+      const email = normalizedRecipientEmail(recipient);
+      if (email) target.add(email);
+    }
+  }
 }
 
 async function findTenant(client, tenantKey) {
@@ -1211,18 +1277,22 @@ async function handleSnapshotHandoff(req, res, config) {
       }
 
       const registry = await upsertRegistry(client, tenant, sendyCampaignId, effectiveCampaign);
-      const parentGroups = await loadTestLeadParentGroups(client, tenant.tenant_id, recipients);
+      const recipientSplit = splitRecipientsForTestMirrors(recipients, effectiveCampaign, sendyCampaignId);
+      const parentGroups = await loadTestLeadParentGroups(
+        client,
+        tenant.tenant_id,
+        recipientSplit.parentRecipients
+      );
+      const mirrorGroups = recipientSplit.mirrorRecipients.length > 0
+        ? await loadTestLeadMirrorGroups(client, tenant.tenant_id, recipientSplit.mirrorRecipients)
+        : [];
       const pinnedRecipientEmails = new Set();
 
-      for (const parentGroup of parentGroups) {
-        for (const recipient of parentGroup.recipients) {
-          const email = String(recipient.email || "").trim().toLowerCase();
-          if (email) pinnedRecipientEmails.add(email);
-        }
-      }
+      addGroupRecipientEmails(pinnedRecipientEmails, parentGroups);
+      addGroupRecipientEmails(pinnedRecipientEmails, mirrorGroups);
 
       const globalRecipients = recipients.filter((recipient) => {
-        const email = String(recipient.email || "").trim().toLowerCase();
+        const email = normalizedRecipientEmail(recipient);
         return !pinnedRecipientEmails.has(email);
       });
 
@@ -1286,10 +1356,6 @@ async function handleSnapshotHandoff(req, res, config) {
         });
       }
 
-      const mirrorGroups =
-        registry.source_system === "poweremail-test-reserve-mirror"
-          ? []
-          : await loadTestLeadMirrorGroups(client, tenant.tenant_id, recipients);
       const mirrorDispatches = [];
 
       for (const [index, mirrorGroup] of mirrorGroups.entries()) {
@@ -1336,6 +1402,12 @@ async function handleSnapshotHandoff(req, res, config) {
         recipientCount,
         batchCount,
         dispatchQueue,
+        testMirrorRecipientSplit: recipientSplit.splitApplied
+          ? {
+              parentRecipients: recipientSplit.parentRecipients.length,
+              mirrorRecipients: recipientSplit.mirrorRecipients.length,
+            }
+          : null,
         parentAliasDispatches,
         mirrorDispatches,
         executionMode: config.executionMode,
