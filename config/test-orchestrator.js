@@ -8,12 +8,12 @@ module.exports = {
   },
   dailySends: {
     weekdays: {
-      minPerBrand: 5,
-      maxPerBrand: 7,
+      minPerBrand: 9,
+      maxPerBrand: 11,
     },
     weekends: {
       minPerBrand: 3,
-      maxPerBrand: 5,
+      maxPerBrand: 6,
     },
   },
   recipientCohorts: {
