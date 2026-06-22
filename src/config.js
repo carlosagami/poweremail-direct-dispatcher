@@ -75,6 +75,11 @@ function loadServiceConfig() {
     relaySmtpUser: process.env.RELAY_SMTP_USER || "",
     relaySmtpPassword: process.env.RELAY_SMTP_PASSWORD || "",
     relayFromEmail: process.env.RELAY_FROM_EMAIL || "",
+    fingerprintGovernanceMode:
+      process.env.FINGERPRINT_GOVERNANCE_MODE || "disabled",
+    fingerprintGovernanceWindowHours: intEnv("FINGERPRINT_GOVERNANCE_WINDOW_HOURS", 24),
+    fingerprintGovernanceEnforceReasons:
+      process.env.FINGERPRINT_GOVERNANCE_ENFORCE_REASONS || "",
   };
 }
 
