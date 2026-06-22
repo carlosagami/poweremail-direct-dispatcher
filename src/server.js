@@ -7,6 +7,38 @@ const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
 const { recordSnapshotFingerprintEvent } = require("./fingerprint");
 
+function csvSet(value) {
+  return new Set(
+    String(value || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  );
+}
+
+function shouldEnforceFingerprintDecision(config, fingerprint) {
+  if (!fingerprint || !fingerprint.enabled) return false;
+  if (String(config.fingerprintGovernanceMode || "").toLowerCase() !== "enforce") return false;
+  if (fingerprint.policyDecision !== "block_duplicate") return false;
+
+  const enforceReasons = csvSet(config.fingerprintGovernanceEnforceReasons);
+  if (enforceReasons.size === 0) return false;
+
+  return enforceReasons.has(fingerprint.decisionReason);
+}
+
+async function cancelFingerprintBlockedRegistry(client, registry) {
+  await client.query(
+    `
+    UPDATE control_plane.sendy_campaign_registry
+       SET direct_dispatch_state = 'cancelled',
+           updated_at = now()
+     WHERE dispatch_campaign_id = $1
+    `,
+    [registry.dispatch_campaign_id]
+  );
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -747,8 +779,10 @@ async function createContentSnapshot(client, registry, campaign, config) {
     [registry.dispatch_campaign_id, insert.rows[0].content_snapshot_id]
   );
 
+  let fingerprint = null;
+
   try {
-    const fingerprint = await recordSnapshotFingerprintEvent(
+    fingerprint = await recordSnapshotFingerprintEvent(
       client,
       config || {},
       registry,
@@ -773,7 +807,10 @@ async function createContentSnapshot(client, registry, campaign, config) {
     });
   }
 
-  return insert.rows[0].content_snapshot_id;
+  return {
+    contentSnapshotId: insert.rows[0].content_snapshot_id,
+    fingerprint,
+  };
 }
 
 async function createAudienceSnapshot(client, registry, campaign, recipients) {
@@ -1330,7 +1367,8 @@ async function handleSnapshotHandoff(req, res, config) {
       let dispatchQueue = "skipped";
 
       if (globalRecipients.length > 0) {
-        contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign, config);
+        const contentSnapshot = await createContentSnapshot(client, registry, effectiveCampaign, config);
+        contentSnapshotId = contentSnapshot.contentSnapshotId;
         audienceSnapshotId = await createAudienceSnapshot(client, registry, effectiveCampaign, globalRecipients);
         recipientCount = await insertRecipients(client, registry, audienceSnapshotId, globalRecipients);
         batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
@@ -1354,7 +1392,8 @@ async function handleSnapshotHandoff(req, res, config) {
       for (const [index, parentGroup] of parentGroups.entries()) {
         const parentRegistry = await createPinnedParentRegistry(client, tenant, registry, parentGroup, index + 1);
         const parentCampaign = buildPinnedParentCampaign(effectiveCampaign, parentGroup, registry.dispatch_campaign_id);
-        const parentContentSnapshotId = await createContentSnapshot(client, parentRegistry, parentCampaign, config);
+        const parentContentSnapshot = await createContentSnapshot(client, parentRegistry, parentCampaign, config);
+        const parentContentSnapshotId = parentContentSnapshot.contentSnapshotId;
         const parentAudienceSnapshotId = await createAudienceSnapshot(
           client,
           parentRegistry,
