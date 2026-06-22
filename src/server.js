@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const { loadServiceConfig } = require("./config");
 const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
+const { recordSnapshotFingerprintEvent } = require("./fingerprint");
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -679,7 +680,7 @@ async function upsertRegistry(client, tenant, sendyCampaignId, campaign) {
   return update.rows[0];
 }
 
-async function createContentSnapshot(client, registry, campaign) {
+async function createContentSnapshot(client, registry, campaign, config) {
   await client.query(
     `
     UPDATE control_plane.campaign_content_snapshots
@@ -745,6 +746,32 @@ async function createContentSnapshot(client, registry, campaign) {
     `,
     [registry.dispatch_campaign_id, insert.rows[0].content_snapshot_id]
   );
+
+  try {
+    const fingerprint = await recordSnapshotFingerprintEvent(
+      client,
+      config || {},
+      registry,
+      campaign,
+      insert.rows[0].content_snapshot_id
+    );
+
+    if (fingerprint.enabled) {
+      logger.info("snapshot_handoff.fingerprint_observed", {
+        tenant_key: registry.tenant_key,
+        sendy_campaign_id: registry.sendy_campaign_id,
+        dispatch_campaign_id: registry.dispatch_campaign_id,
+        ...fingerprint,
+      });
+    }
+  } catch (error) {
+    logger.warn("snapshot_handoff.fingerprint_observe_failed", {
+      tenant_key: registry.tenant_key,
+      sendy_campaign_id: registry.sendy_campaign_id,
+      dispatch_campaign_id: registry.dispatch_campaign_id,
+      error: { name: error.name, message: error.message },
+    });
+  }
 
   return insert.rows[0].content_snapshot_id;
 }
@@ -1303,7 +1330,7 @@ async function handleSnapshotHandoff(req, res, config) {
       let dispatchQueue = "skipped";
 
       if (globalRecipients.length > 0) {
-        contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign);
+        contentSnapshotId = await createContentSnapshot(client, registry, effectiveCampaign, config);
         audienceSnapshotId = await createAudienceSnapshot(client, registry, effectiveCampaign, globalRecipients);
         recipientCount = await insertRecipients(client, registry, audienceSnapshotId, globalRecipients);
         batchCount = await createBatches(client, registry, audienceSnapshotId, batchSize);
@@ -1327,7 +1354,7 @@ async function handleSnapshotHandoff(req, res, config) {
       for (const [index, parentGroup] of parentGroups.entries()) {
         const parentRegistry = await createPinnedParentRegistry(client, tenant, registry, parentGroup, index + 1);
         const parentCampaign = buildPinnedParentCampaign(effectiveCampaign, parentGroup, registry.dispatch_campaign_id);
-        const parentContentSnapshotId = await createContentSnapshot(client, parentRegistry, parentCampaign);
+        const parentContentSnapshotId = await createContentSnapshot(client, parentRegistry, parentCampaign, config);
         const parentAudienceSnapshotId = await createAudienceSnapshot(
           client,
           parentRegistry,
@@ -1361,7 +1388,7 @@ async function handleSnapshotHandoff(req, res, config) {
       for (const [index, mirrorGroup] of mirrorGroups.entries()) {
         const mirrorRegistry = await createMirrorRegistry(client, tenant, registry, mirrorGroup, index + 1);
         const mirrorCampaign = buildMirrorCampaign(effectiveCampaign, mirrorGroup, registry.dispatch_campaign_id);
-        const mirrorContentSnapshotId = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign);
+        const mirrorContentSnapshotId = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
         const mirrorAudienceSnapshotId = await createAudienceSnapshot(
           client,
           mirrorRegistry,
