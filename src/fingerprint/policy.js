@@ -26,6 +26,14 @@ function campaignSourceJson(campaign) {
   }
 }
 
+function inferSourceSystem(sourceJson, registry) {
+  if (sourceJson.test_reserve_mirror) return "poweremail-test-reserve-mirror";
+  if (sourceJson.test_parent_alias) return "poweremail-test-parent-alias";
+  if (sourceJson.source_system) return String(sourceJson.source_system);
+  if (registry.source_system) return String(registry.source_system);
+  return "sendy";
+}
+
 function inferSendType(sourceJson) {
   if (sourceJson.send_type) return String(sourceJson.send_type);
   if (sourceJson.test_reserve_mirror) return "reserve_mirror";
@@ -52,10 +60,7 @@ function buildSnapshotContext(registry, campaign, contentSnapshotId) {
     dispatch_campaign_id: registry.dispatch_campaign_id || null,
     sendy_campaign_id: registry.sendy_campaign_id || campaign.id || null,
     content_snapshot_id: contentSnapshotId || null,
-    source_system:
-      optionalString(sourceJson.source_system) ||
-      optionalString(registry.source_system) ||
-      "sendy",
+    source_system: inferSourceSystem(sourceJson, registry),
     source_object_id:
       optionalString(sourceJson.source_object_id) ||
       optionalString(registry.source_object_id) ||
