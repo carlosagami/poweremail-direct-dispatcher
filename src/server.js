@@ -1427,7 +1427,30 @@ async function handleSnapshotHandoff(req, res, config) {
       for (const [index, mirrorGroup] of mirrorGroups.entries()) {
         const mirrorRegistry = await createMirrorRegistry(client, tenant, registry, mirrorGroup, index + 1);
         const mirrorCampaign = buildMirrorCampaign(effectiveCampaign, mirrorGroup, registry.dispatch_campaign_id);
-        const mirrorContentSnapshotId = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
+        const mirrorContentSnapshot = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
+        const mirrorContentSnapshotId = mirrorContentSnapshot.contentSnapshotId;
+
+        if (shouldEnforceFingerprintDecision(config, mirrorContentSnapshot.fingerprint)) {
+          await cancelFingerprintBlockedRegistry(client, mirrorRegistry);
+
+          mirrorDispatches.push({
+            dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
+            fromEmail: mirrorGroup.fromEmail,
+            replyTo: mirrorGroup.replyTo,
+            reserveDomain: mirrorGroup.reserveDomain,
+            sourceRole: mirrorGroup.sourceRole,
+            recipientCount: 0,
+            batchCount: 0,
+            contentSnapshotId: Number(mirrorContentSnapshotId),
+            audienceSnapshotId: null,
+            dispatchQueue: "fingerprint_enforced",
+            skipped: true,
+            fingerprintDecision: mirrorContentSnapshot.fingerprint.policyDecision,
+            fingerprintReason: mirrorContentSnapshot.fingerprint.decisionReason,
+          });
+          continue;
+        }
+
         const mirrorAudienceSnapshotId = await createAudienceSnapshot(
           client,
           mirrorRegistry,
