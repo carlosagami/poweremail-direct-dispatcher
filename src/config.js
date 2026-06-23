@@ -80,6 +80,18 @@ function loadServiceConfig() {
     fingerprintGovernanceWindowHours: intEnv("FINGERPRINT_GOVERNANCE_WINDOW_HOURS", 24),
     fingerprintGovernanceEnforceReasons:
       process.env.FINGERPRINT_GOVERNANCE_ENFORCE_REASONS || "",
+    openaiApiKey: process.env.OPENAI_API_KEY || "",
+    fingerprintVariantsEnabled: boolEnv("FINGERPRINT_VARIANTS_ENABLED", false),
+    fingerprintVariantsMode: process.env.FINGERPRINT_VARIANTS_MODE || "observe_only",
+    fingerprintVariantModel: process.env.FINGERPRINT_VARIANT_MODEL || "",
+    fingerprintVariantMaxAttempts: intEnv("FINGERPRINT_VARIANT_MAX_ATTEMPTS", 3),
+    fingerprintVariantTimeoutMs: intEnv("FINGERPRINT_VARIANT_TIMEOUT_MS", 20000),
+    fingerprintVariantMinChangedLayers: intEnv("FINGERPRINT_VARIANT_MIN_CHANGED_LAYERS", 3),
+    fingerprintVariantMaxNgramOverlap: floatEnv("FINGERPRINT_VARIANT_MAX_NGRAM_OVERLAP", 0.35),
+    fingerprintVariantMaxFirstWindowOverlap: floatEnv(
+      "FINGERPRINT_VARIANT_MAX_FIRST_WINDOW_OVERLAP",
+      0.55
+    ),
   };
 }
 
