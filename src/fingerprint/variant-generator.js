@@ -68,8 +68,7 @@ function buildVariantCampaign(campaign, variant, metadata) {
   const variantBody = String(variant.variant_body || "").trim();
   const variantSubject = String(variant.variant_subject || "").trim();
   const variantHtml = bodyToHtml(variantBody);
-  const variantSourceJson = {
-    ...(sourceJson && typeof sourceJson === "object" && !Array.isArray(sourceJson) ? sourceJson : {}),
+  const variantMetadata = {
     fingerprint_variant: true,
     fingerprint_variant_strategy: variant.variant_strategy,
     fingerprint_variant_changed_layers: variant.changed_layers || [],
@@ -77,9 +76,14 @@ function buildVariantCampaign(campaign, variant, metadata) {
     fingerprint_variant_attempt: metadata.attempt,
     fingerprint_variant_parent_event_id: metadata.parentFingerprintEventId || null,
   };
+  const variantSourceJson = {
+    ...(sourceJson && typeof sourceJson === "object" && !Array.isArray(sourceJson) ? sourceJson : {}),
+    ...variantMetadata,
+  };
 
   return {
     ...campaign,
+    ...variantMetadata,
     subject: variantSubject,
     title: variantSubject,
     plain_text: variantBody,
@@ -239,9 +243,23 @@ async function generateFingerprintVariant(config, campaign, context = {}) {
     const validation = validateFingerprintVariant(campaign, variantCampaign, config);
 
     if (validation.valid) {
+      const validationMetadata = {
+        fingerprint_variant_validation: validation.checks || null,
+        fingerprint_variant_validated_at: new Date().toISOString(),
+      };
+      const sourceJson = {
+        ...(variantCampaign.source_json || variantCampaign.sourceJson || {}),
+        ...validationMetadata,
+      };
+
       return {
         ok: true,
-        campaign: variantCampaign,
+        campaign: {
+          ...variantCampaign,
+          ...validationMetadata,
+          source_json: sourceJson,
+          sourceJson,
+        },
         variant,
         validation,
         attempt,
