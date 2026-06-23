@@ -6,6 +6,7 @@ const { loadServiceConfig } = require("./config");
 const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
 const { recordSnapshotFingerprintEvent } = require("./fingerprint");
+const { generateFingerprintVariant } = require("./fingerprint/variant-generator");
 
 function csvSet(value) {
   return new Set(
@@ -1426,29 +1427,85 @@ async function handleSnapshotHandoff(req, res, config) {
 
       for (const [index, mirrorGroup] of mirrorGroups.entries()) {
         const mirrorRegistry = await createMirrorRegistry(client, tenant, registry, mirrorGroup, index + 1);
-        const mirrorCampaign = buildMirrorCampaign(effectiveCampaign, mirrorGroup, registry.dispatch_campaign_id);
-        const mirrorContentSnapshot = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
-        const mirrorContentSnapshotId = mirrorContentSnapshot.contentSnapshotId;
+        let mirrorCampaign = buildMirrorCampaign(effectiveCampaign, mirrorGroup, registry.dispatch_campaign_id);
+        let mirrorContentSnapshot = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
+        let mirrorContentSnapshotId = mirrorContentSnapshot.contentSnapshotId;
 
         if (shouldEnforceFingerprintDecision(config, mirrorContentSnapshot.fingerprint)) {
-          await cancelFingerprintBlockedRegistry(client, mirrorRegistry);
+          let variantResult = null;
 
-          mirrorDispatches.push({
-            dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
-            fromEmail: mirrorGroup.fromEmail,
-            replyTo: mirrorGroup.replyTo,
-            reserveDomain: mirrorGroup.reserveDomain,
-            sourceRole: mirrorGroup.sourceRole,
-            recipientCount: 0,
-            batchCount: 0,
-            contentSnapshotId: Number(mirrorContentSnapshotId),
-            audienceSnapshotId: null,
-            dispatchQueue: "fingerprint_enforced",
-            skipped: true,
-            fingerprintDecision: mirrorContentSnapshot.fingerprint.policyDecision,
-            fingerprintReason: mirrorContentSnapshot.fingerprint.decisionReason,
-          });
-          continue;
+          try {
+            variantResult = await generateFingerprintVariant(config, mirrorCampaign, {
+              tenantKey: tenant.tenant_key,
+              fromEmail: mirrorGroup.fromEmail,
+              domainRole: "reserve",
+              parentFingerprintEventId: mirrorContentSnapshot.fingerprint.fingerprintEventId,
+            });
+          } catch (error) {
+            logger.warn("snapshot_handoff.fingerprint_variant_failed", {
+              tenant_key: tenant.tenant_key,
+              dispatch_campaign_id: mirrorRegistry.dispatch_campaign_id,
+              reason: "variant_generation_error",
+              error: { name: error.name, message: error.message },
+            });
+          }
+
+          if (variantResult?.ok) {
+            mirrorCampaign = variantResult.campaign;
+            mirrorContentSnapshot = await createContentSnapshot(client, mirrorRegistry, mirrorCampaign, config);
+            mirrorContentSnapshotId = mirrorContentSnapshot.contentSnapshotId;
+
+            logger.info("snapshot_handoff.fingerprint_variant_applied", {
+              tenant_key: tenant.tenant_key,
+              dispatch_campaign_id: mirrorRegistry.dispatch_campaign_id,
+              content_snapshot_id: mirrorContentSnapshotId,
+              attempt: variantResult.attempt,
+              variant_strategy: variantResult.variant?.variant_strategy || null,
+              validation: variantResult.validation?.checks || null,
+            });
+
+            if (shouldEnforceFingerprintDecision(config, mirrorContentSnapshot.fingerprint)) {
+              await cancelFingerprintBlockedRegistry(client, mirrorRegistry);
+
+              mirrorDispatches.push({
+                dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
+                fromEmail: mirrorGroup.fromEmail,
+                replyTo: mirrorGroup.replyTo,
+                reserveDomain: mirrorGroup.reserveDomain,
+                sourceRole: mirrorGroup.sourceRole,
+                recipientCount: 0,
+                batchCount: 0,
+                contentSnapshotId: Number(mirrorContentSnapshotId),
+                audienceSnapshotId: null,
+                dispatchQueue: "fingerprint_enforced",
+                skipped: true,
+                variantRejected: true,
+                fingerprintDecision: mirrorContentSnapshot.fingerprint.policyDecision,
+                fingerprintReason: mirrorContentSnapshot.fingerprint.decisionReason,
+              });
+              continue;
+            }
+          } else {
+            await cancelFingerprintBlockedRegistry(client, mirrorRegistry);
+
+            mirrorDispatches.push({
+              dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
+              fromEmail: mirrorGroup.fromEmail,
+              replyTo: mirrorGroup.replyTo,
+              reserveDomain: mirrorGroup.reserveDomain,
+              sourceRole: mirrorGroup.sourceRole,
+              recipientCount: 0,
+              batchCount: 0,
+              contentSnapshotId: Number(mirrorContentSnapshotId),
+              audienceSnapshotId: null,
+              dispatchQueue: "fingerprint_enforced",
+              skipped: true,
+              variantReason: variantResult?.reason || "variant_unavailable",
+              fingerprintDecision: mirrorContentSnapshot.fingerprint.policyDecision,
+              fingerprintReason: mirrorContentSnapshot.fingerprint.decisionReason,
+            });
+            continue;
+          }
         }
 
         const mirrorAudienceSnapshotId = await createAudienceSnapshot(
