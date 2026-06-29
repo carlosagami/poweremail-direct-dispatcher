@@ -24,6 +24,34 @@ const FORBIDDEN_TERMS = [
   "solo por hoy",
   "garantizado",
   "imperdible",
+  "observe",
+  "observé",
+  "vi que",
+  "note que",
+  "noté que",
+  "he estado revisando",
+  "me llamo la atencion",
+  "me llamó la atención",
+  "como manejan actualmente",
+  "cómo manejan actualmente",
+  "han considerado",
+  "te interesaria",
+  "te interesaría",
+  "estarias abierto",
+  "estarías abierto",
+  "si tiene sentido",
+  "si te parece util",
+  "si te parece útil",
+  "te gustaria saber mas",
+  "te gustaría saber más",
+  "agenda una llamada",
+  "demo",
+  "reunion",
+  "reunión",
+  "quedo atento",
+  "quedo atenta",
+  "espero tus comentarios",
+  "saludos cordiales",
 ];
 
 const REQUIRED_MATRIX_AXES = [
@@ -37,6 +65,11 @@ const REQUIRED_MATRIX_AXES = [
   "product_presence",
   "question_presence",
   "personalization_level",
+  "energy",
+  "rhythm",
+  "punctuation",
+  "first_person",
+  "formality",
 ];
 
 function clampNumber(value, fallback, min, max) {
@@ -163,7 +196,7 @@ function hasTemplateOpening(value) {
 }
 
 function hasTemplateClosing(value) {
-  return /(quedo atento|quedo atenta|quedamos atentos|saludos cordiales|cordialmente)\.?\s*$/i.test(
+  return /(quedo atento|quedo atenta|quedamos atentos|saludos cordiales|cordialmente|espero tus comentarios)\.?\s*$/i.test(
     String(value || "").trim()
   );
 }
@@ -297,9 +330,11 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
     !checks.hasEmailAddress &&
     checks.noNewUrls &&
     checks.forbiddenTerms.length === 0 &&
+    !checks.hasTemplateOpening &&
     !checks.hasTemplateClosing &&
     checks.hasVariationMatrix &&
     checks.ctaMatchesMatrix &&
+    checks.ctaLevel !== "direct" &&
     checks.automationRisk !== "high" &&
     Boolean(checks.intentType) &&
     changedLayers.length >= minChangedLayers;
