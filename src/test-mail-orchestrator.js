@@ -214,7 +214,7 @@ function buildHtmlFromPlainText(plainText) {
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/\"/g, "&quot;");
 
   return String(plainText)
     .trim()
@@ -236,32 +236,55 @@ function normalizeHtmlSpacing(htmlText, plainText) {
 
 function buildLocalCopy(brand, slot) {
   const topic = topicForSlot(brand, slot);
-  const subjectMap = {
-    colonyspaces: `Seguimiento sobre ${topic}`,
-    decosimil: `Revision de ${topic}`,
-    georgieboy: `Opciones de ${topic}`,
-    lester: `Notas sobre ${topic}`,
-    shopology: `Avance de ${topic}`,
-  };
+  const subjectOptions = [
+    `Nota de ${topic}`,
+    `Sobre ${topic}`,
+    `Detalle de ${topic}`,
+    `Un punto de ${topic}`,
+    `Contexto breve`,
+    `Para tenerlo presente`,
+  ];
+  const subject = subjectOptions[hashInt(`${slot.slotId}:local-subject`) % subjectOptions.length];
+  const sender = brand.senderPersona || brand.senderDisplayName || "";
+  const profiles = [
+    [
+      `Sobre ${topic}: lo dejaria simple por ahora.`,
+      "Hay detalles que se entienden mejor cuando se miran desde el uso diario, no desde una lista larga.",
+      sender,
+    ],
+    [
+      `Me quedo dando vueltas el tema de ${topic}.`,
+      "No parece algo para resolver con una respuesta enorme; mas bien conviene tenerlo claro antes de mover piezas.",
+    ],
+    [
+      `Dejo esta nota para no perder el hilo de ${topic}.`,
+      `En ${brand.brandName} conviene mantenerlo claro y sin meter ruido de mas.`,
+      "Nada mas por ahora.",
+    ],
+    [
+      `El punto de ${topic} puede quedarse como referencia para la siguiente revision interna.`,
+    ],
+    [
+      "Una cosa pequena, pero vale la pena tenerla presente.",
+      `${topic} suele verse distinto cuando se baja al caso real y no al ejemplo perfecto.`,
+      "Lo dejo anotado aqui.",
+    ],
+    [
+      `${topic} no necesita una explicacion larga en este momento.`,
+      "Con que quede ubicado el criterio principal, ya ayuda a ordenar mejor lo demas.",
+      `${sender}\n${brand.brandName}`,
+    ],
+    [
+      `Pregunta corta sobre ${topic}: cual dato conviene tomar como referencia principal?`,
+      "Con eso alcanza para no mezclar criterios despues.",
+    ],
+    [
+      `Anoto lo de ${topic} como comentario operativo.`,
+      "No lo veo como tema grande, solo como algo que conviene mantener consistente.",
+    ],
+  ];
 
-  const subject = subjectMap[brand.tenantKey] || `Seguimiento sobre ${topic}`;
-  const body = [
-    "Hola,",
-    "",
-    `Estuve pensando en ${topic} y creo que conviene revisarlo con un enfoque practico y aterrizado al dia a dia.`,
-    "",
-    `En ${brand.brandName} podemos preparar una recomendacion breve considerando ${brand.businessDomain}, sin hacerlo mas complejo de lo necesario.`,
-    "",
-    "Si me compartes un poco mas de contexto sobre lo que quieres priorizar, puedo dejarte una propuesta mas puntual para revisarla contigo.",
-    "",
-    brand.senderPersona === "Georgina" ? "Quedo atenta." : "Quedo atento.",
-    "",
-    "Saludos,",
-    "",
-    brand.senderPersona,
-    "",
-    brand.brandName,
-  ].join("\n");
+  const body = profiles[hashInt(`${slot.slotId}:local-profile`) % profiles.length].join("\n\n");
 
   return {
     subject,
@@ -302,18 +325,24 @@ function copyTemperature() {
 
 function copyPrompt(brand, slot, topic, dateText) {
   return [
-    "Genera un correo outbound breve en espanol neutro/latam.",
+    "Genera un correo breve en espanol neutro/latam para trafico de diagnostico o conversacion inicial.",
     "Responde exclusivamente JSON valido con estas llaves: subject, plainText, htmlText.",
     "No uses markdown. No incluyas explicaciones.",
-    "El correo debe sonar humano, especifico y contextual a la marca que envia.",
-    "No debe sonar a brochure, pitch comercial ni plantilla generica.",
-    "Usa una observacion concreta del contexto del negocio y luego una pregunta o siguiente paso suave.",
-    "Evita estas frases y construcciones: 'queria contarte', 'contamos con', 'te ofrecemos', 'tenemos la solucion', 'te gustaria saber mas', 'agenda una llamada', 'descubre', 'potencia', 'ideal para'.",
+    "Objetivo principal: que parezca una comunicacion humana normal, no un correo de vendedor, SDR, cold outreach, newsletter ni secuencia automatizada.",
+    "No busques crear el mejor correo de prospeccion. Busca el correo menos identificable como prospeccion manteniendo naturalidad.",
+    "Puede ser una observacion casual, nota breve, comentario operativo, reflexion corta, aclaracion, reaccion humana, seguimiento natural o mensaje neutro.",
+    "No asumas que debe existir pregunta, CTA, invitacion, reunion, demo, conversacion futura, oferta o intencion comercial.",
+    "Preferencia de distribucion: la mayoria sin CTA, la mayoria sin pregunta, algunos sin saludo, algunos sin despedida tradicional, algunos muy cortos.",
+    "Si incluyes una pregunta, usa maximo una y que sea simple. Evita preguntas exploratorias de prospeccion.",
+    "Evita completamente estas frases o estructuras: Hola, Observe, Vi que, Note que, He estado revisando, Me llamo la atencion, Como manejan actualmente, Han considerado, Te interesaria, Estarias abierto, Si tiene sentido, Si te parece util, Quedo atento, Quedo atenta, Espero tus comentarios, Saludos cordiales.",
+    "Evita tambien: queria contarte, contamos con, te ofrecemos, tenemos la solucion, te gustaria saber mas, agenda una llamada, descubre, potencia, ideal para, gratis, oferta, promocion, descuento, ultima oportunidad.",
     "No prometas descuentos, resultados garantizados, urgencias falsas ni claims medicos.",
     "No menciones que fue generado por IA.",
     "JAMAS incluyas una direccion de correo electronico en subject, plainText o htmlText.",
-    "El subject debe tener maximo 75 caracteres y sonar natural, no promocional.",
-    "El plainText debe tener 70 a 130 palabras, con saludo, contexto, pregunta o CTA suave, despedida y firma.",
+    "El subject debe tener maximo 75 caracteres y sonar natural, neutro y no promocional.",
+    "El plainText puede tener 12 a 120 palabras. Varia longitud, ritmo, cantidad de parrafos, formalidad, puntuacion y presencia de firma.",
+    "No uses siempre la marca. No uses siempre producto o servicio. No cierres siempre de la misma manera.",
+    "Antes de responder, evalua: 'se parece a un correo de cold outreach?'. Si la respuesta es si, reescribelo.",
     "El htmlText debe contener el mismo contenido que plainText en HTML simple.",
     "En htmlText separa cada parrafo con dos lineas <br><br> entre etiquetas </p> y <p>.",
     "Datos del envio:",
