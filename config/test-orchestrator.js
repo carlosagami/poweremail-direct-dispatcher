@@ -8,18 +8,18 @@ module.exports = {
   },
   dailySends: {
     weekdays: {
-      minPerBrand: 9,
-      maxPerBrand: 11,
+      minPerBrand: 1,
+      maxPerBrand: 2,
     },
     weekends: {
-      minPerBrand: 3,
-      maxPerBrand: 6,
+      minPerBrand: 1,
+      maxPerBrand: 1,
     },
   },
   recipientCohorts: {
     enabled: true,
-    minRecipientsPerSlot: 3,
-    maxRecipientsPerSlot: 5,
+    minRecipientsPerSlot: 1,
+    maxRecipientsPerSlot: 2,
   },
   intervalJitter: {
     minHours: 2,
@@ -51,9 +51,9 @@ module.exports = {
       tenantKey: "decosimil",
       brandName: "Deco-Simil",
       sendyAppName: "Deco-Simíl",
-      sendyTestListId: 50,
       senderPersona: "Andrés Itzkowich",
       senderDisplayName: "Andrés Itzkowich",
+      sendyTestListId: 50,
       businessDomain: "telas, papel tapiz, viniles y materiales decorativos",
       topics: [
         "seleccion de materiales",
