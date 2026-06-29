@@ -51,9 +51,9 @@ module.exports = {
       tenantKey: "decosimil",
       brandName: "Deco-Simil",
       sendyAppName: "Deco-Simíl",
+      sendyTestListId: 50,
       senderPersona: "Andrés Itzkowich",
       senderDisplayName: "Andrés Itzkowich",
-      sendyTestListId: 50,
       businessDomain: "telas, papel tapiz, viniles y materiales decorativos",
       topics: [
         "seleccion de materiales",
