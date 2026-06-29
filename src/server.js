@@ -814,6 +814,26 @@ async function createContentSnapshot(client, registry, campaign, config) {
   };
 }
 
+async function markFingerprintVariantFailure(client, contentSnapshotId, variantResult) {
+  const reason = variantResult?.reason || "variant_unavailable";
+  const feedback = variantResult?.feedback || null;
+
+  await client.query(
+    `
+    UPDATE control_plane.campaign_content_snapshots
+       SET source_json = COALESCE(source_json, '{}'::jsonb) || jsonb_build_object(
+             'fingerprint_variant', false,
+             'fingerprint_variant_failure_reason', $2::text,
+             'fingerprint_variant_validation_feedback', $3::jsonb,
+             'fingerprint_variant_failed_at', now()
+           ),
+           updated_at = now()
+     WHERE content_snapshot_id = $1
+    `,
+    [contentSnapshotId, reason, JSON.stringify(feedback)]
+  );
+}
+
 async function createAudienceSnapshot(client, registry, campaign, recipients) {
   await client.query(
     `
@@ -1486,7 +1506,16 @@ async function handleSnapshotHandoff(req, res, config) {
               continue;
             }
           } else {
+            await markFingerprintVariantFailure(client, mirrorContentSnapshotId, variantResult);
             await cancelFingerprintBlockedRegistry(client, mirrorRegistry);
+
+            logger.warn("snapshot_handoff.fingerprint_variant_rejected", {
+              tenant_key: tenant.tenant_key,
+              dispatch_campaign_id: mirrorRegistry.dispatch_campaign_id,
+              content_snapshot_id: mirrorContentSnapshotId,
+              reason: variantResult?.reason || "variant_unavailable",
+              feedback: variantResult?.feedback || null,
+            });
 
             mirrorDispatches.push({
               dispatchCampaignId: Number(mirrorRegistry.dispatch_campaign_id),
