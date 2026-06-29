@@ -234,57 +234,118 @@ function normalizeHtmlSpacing(htmlText, plainText) {
   return buildHtmlFromPlainText(plainText);
 }
 
+const BASE_COPY_STYLES = [
+  {
+    id: "one_line_note",
+    label: "nota de una linea",
+    matrix: { length: "muy corto", tone: "neutro", structure: "una frase", cta: "none", question: "none", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "casual" },
+  },
+  {
+    id: "phone_fragment",
+    label: "fragmento desde celular",
+    matrix: { length: "corto", tone: "rapido", structure: "dos parrafos breves", cta: "none", question: "none", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "informal" },
+  },
+  {
+    id: "operational_comment",
+    label: "comentario operativo",
+    matrix: { length: "medio", tone: "practico", structure: "nota operativa", cta: "none", question: "none", greeting: "none", closing: "minimal", brand: "optional", product: "topic_only", formality: "sobrio" },
+  },
+  {
+    id: "quiet_observation",
+    label: "observacion tranquila",
+    matrix: { length: "corto", tone: "reflexivo", structure: "observacion simple", cta: "none", question: "none", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "neutral" },
+  },
+  {
+    id: "single_question",
+    label: "microconsulta",
+    matrix: { length: "muy corto", tone: "directo", structure: "una pregunta simple", cta: "soft", question: "one", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "casual" },
+  },
+  {
+    id: "long_personal_note",
+    label: "explicacion personal",
+    matrix: { length: "largo", tone: "humano", structure: "cuatro parrafos", cta: "none", question: "none", greeting: "optional", closing: "natural", brand: "optional", product: "topic_only", formality: "conversacional" },
+  },
+  {
+    id: "formal_record",
+    label: "registro formal",
+    matrix: { length: "corto", tone: "sobrio", structure: "registro breve", cta: "none", question: "none", greeting: "none", closing: "minimal", brand: "optional", product: "topic_only", formality: "formal" },
+  },
+  {
+    id: "acknowledgement",
+    label: "acuse simple",
+    matrix: { length: "muy corto", tone: "simple", structure: "acuse", cta: "none", question: "none", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "casual" },
+  },
+  {
+    id: "internal_note",
+    label: "nota interna",
+    matrix: { length: "medio", tone: "interno", structure: "apunte contextual", cta: "none", question: "none", greeting: "none", closing: "none", brand: "none", product: "topic_only", formality: "neutral" },
+  },
+  {
+    id: "neutral_clarification",
+    label: "aclaracion neutra",
+    matrix: { length: "corto", tone: "claro", structure: "aclaracion", cta: "none", question: "none", greeting: "none", closing: "minimal", brand: "optional", product: "topic_only", formality: "neutral" },
+  },
+];
+
+function copyStyleForSlot(brand, slot) {
+  const index = hashInt(`${slot.slotId}:${brand.tenantKey}:base-copy-style`) % BASE_COPY_STYLES.length;
+  return BASE_COPY_STYLES[index];
+}
+
 function buildLocalCopy(brand, slot) {
   const topic = topicForSlot(brand, slot);
-  const subjectOptions = [
-    `Nota de ${topic}`,
-    `Sobre ${topic}`,
-    `Detalle de ${topic}`,
-    `Un punto de ${topic}`,
-    `Contexto breve`,
-    `Para tenerlo presente`,
-  ];
-  const subject = subjectOptions[hashInt(`${slot.slotId}:local-subject`) % subjectOptions.length];
+  const style = copyStyleForSlot(brand, slot);
   const sender = brand.senderPersona || brand.senderDisplayName || "";
-  const profiles = [
-    [
-      `Sobre ${topic}: lo dejaria simple por ahora.`,
-      "Hay detalles que se entienden mejor cuando se miran desde el uso diario, no desde una lista larga.",
-      sender,
-    ],
-    [
-      `Me quedo dando vueltas el tema de ${topic}.`,
-      "No parece algo para resolver con una respuesta enorme; mas bien conviene tenerlo claro antes de mover piezas.",
-    ],
-    [
-      `Dejo esta nota para no perder el hilo de ${topic}.`,
-      `En ${brand.brandName} conviene mantenerlo claro y sin meter ruido de mas.`,
-      "Nada mas por ahora.",
-    ],
-    [
-      `El punto de ${topic} puede quedarse como referencia para la siguiente revision interna.`,
-    ],
-    [
-      "Una cosa pequena, pero vale la pena tenerla presente.",
-      `${topic} suele verse distinto cuando se baja al caso real y no al ejemplo perfecto.`,
-      "Lo dejo anotado aqui.",
-    ],
-    [
-      `${topic} no necesita una explicacion larga en este momento.`,
-      "Con que quede ubicado el criterio principal, ya ayuda a ordenar mejor lo demas.",
-      `${sender}\n${brand.brandName}`,
-    ],
-    [
-      `Pregunta corta sobre ${topic}: cual dato conviene tomar como referencia principal?`,
-      "Con eso alcanza para no mezclar criterios despues.",
-    ],
-    [
-      `Anoto lo de ${topic} como comentario operativo.`,
-      "No lo veo como tema grande, solo como algo que conviene mantener consistente.",
-    ],
-  ];
+  const subjectByStyle = {
+    one_line_note: ["Nota breve", "Punto suelto", "Referencia corta"],
+    phone_fragment: ["Lo dejo anotado", "Detalle rapido", "Para ubicarlo"],
+    operational_comment: ["Comentario operativo", "Punto operativo", "Registro breve"],
+    quiet_observation: ["Un comentario", "Detalle simple", "Algo para tener presente"],
+    single_question: ["Pregunta corta", "Una duda puntual", "Dato por confirmar"],
+    long_personal_note: ["Contexto breve", "Un poco de contexto", "Nota con contexto"],
+    formal_record: ["Registro breve", "Constancia simple", "Referencia interna"],
+    acknowledgement: ["Recibido", "Anotado", "Queda ubicado"],
+    internal_note: ["Nota interna", "Apunte de contexto", "Referencia de trabajo"],
+    neutral_clarification: ["Aclaracion breve", "Para dejarlo claro", "Punto de referencia"],
+  };
+  const subjectOptions = subjectByStyle[style.id] || ["Nota breve"];
+  const subject = subjectOptions[hashInt(`${slot.slotId}:local-subject:${style.id}`) % subjectOptions.length];
 
-  const body = profiles[hashInt(`${slot.slotId}:local-profile`) % profiles.length].join("\n\n");
+  const bodies = {
+    one_line_note: [`${topic}: lo dejaria asi por ahora.`],
+    phone_fragment: [`Solo para dejar anotado lo de ${topic}.`, "Lo demas puede esperar."],
+    operational_comment: [
+      "Registro esto como punto operativo.",
+      `${topic} queda mejor si se mantiene con un criterio unico y sin mezclar explicaciones.`,
+      "Nada adicional por ahora.",
+    ],
+    quiet_observation: [
+      `Hay algo de ${topic} que conviene mirar con calma.`,
+      "A veces el dato pequeno termina ordenando mejor el resto.",
+    ],
+    single_question: [`Sobre ${topic}, cual dato dejamos como referencia principal?`],
+    long_personal_note: [
+      `Me quede pensando en ${topic}.`,
+      "No lo pondria como un tema grande ni como algo para resolver con mucha vuelta.",
+      "A veces alcanza con dejar clara una referencia y evitar que cada quien lo interprete distinto.",
+      sender ? sender : "Lo dejo aqui.",
+    ],
+    formal_record: [
+      `Dejo constancia breve sobre ${topic}.`,
+      `El punto queda registrado como referencia de ${brand.brandName}.`,
+    ],
+    acknowledgement: [`Recibido lo de ${topic}.`, "Queda ubicado."],
+    internal_note: [
+      `Apunte interno sobre ${topic}.`,
+      "No lo veo como conversacion larga; solo como una referencia para no perder consistencia.",
+    ],
+    neutral_clarification: [
+      `Para dejarlo claro: ${topic} no necesita una explicacion extensa en este momento.`,
+      "Con mantener el criterio principal alcanza.",
+    ],
+  };
+
+  const body = (bodies[style.id] || bodies.one_line_note).join("\n\n");
 
   return {
     subject,
@@ -292,6 +353,10 @@ function buildLocalCopy(brand, slot) {
     htmlText: buildHtmlFromPlainText(body),
     topic,
     source: "local",
+    baseCopyStyle: style.id,
+    baseCopyStyleName: style.label,
+    baseCopyMatrix: style.matrix,
+    baseCopyAutomationRisk: "low",
   };
 }
 
@@ -323,7 +388,7 @@ function copyTemperature() {
   return parsed;
 }
 
-function copyPrompt(brand, slot, topic, dateText) {
+function copyPrompt(brand, slot, topic, dateText, style) {
   return [
     "Genera un correo breve en espanol neutro/latam para trafico de diagnostico o conversacion inicial.",
     "Responde exclusivamente JSON valido con estas llaves: subject, plainText, htmlText.",
@@ -345,6 +410,11 @@ function copyPrompt(brand, slot, topic, dateText) {
     "Antes de responder, evalua: 'se parece a un correo de cold outreach?'. Si la respuesta es si, reescribelo.",
     "El htmlText debe contener el mismo contenido que plainText en HTML simple.",
     "En htmlText separa cada parrafo con dos lineas <br><br> entre etiquetas </p> y <p>.",
+    "Debes respetar el estilo base seleccionado. No cambies a formato de prospeccion ni a estructura saludo-investigacion-pregunta-cierre.",
+    "Si el estilo base indica question=none, no incluyas preguntas. Si indica cta=none, no pidas respuesta, reunion, llamada ni siguiente paso.",
+    "El resultado debe parecer escrito desde el origen con ese estilo, no como una variante de una plantilla comercial.",
+    "Estilo base requerido:",
+    JSON.stringify(style),
     "Datos del envio:",
     JSON.stringify({
       tenantKey: brand.tenantKey,
@@ -472,7 +542,7 @@ async function buildCopy(brand, slot, dateText) {
   if (!shouldUseAiCopy(mode)) return fallback;
 
   try {
-    const prompt = copyPrompt(brand, slot, fallback.topic, dateText);
+    const prompt = copyPrompt(brand, slot, fallback.topic, dateText, { id: fallback.baseCopyStyle, label: fallback.baseCopyStyleName, matrix: fallback.baseCopyMatrix });
     const generated = await callOpenAi(prompt);
     return normalizeAiCopy(generated, fallback);
   } catch (error) {
@@ -588,6 +658,10 @@ function buildHandoffPayload(brand, slot, sender, copy, recipients) {
         mirrors_enabled: orchestratorConfig.dispatch.mirrorsEnabled,
         copy_source: copy.source,
         copy_topic: copy.topic,
+        base_copy_style: copy.baseCopyStyle || null,
+        base_copy_style_name: copy.baseCopyStyleName || null,
+        base_copy_matrix: copy.baseCopyMatrix || null,
+        base_copy_automation_risk: copy.baseCopyAutomationRisk || null,
       },
     },
     recipients,
@@ -661,6 +735,9 @@ function buildCopyPreviews(planned, limit) {
     htmlText: item.copy.htmlText,
     copySource: item.copy.source,
     copyTopic: item.copy.topic,
+    baseCopyStyle: item.copy.baseCopyStyle,
+    baseCopyStyleName: item.copy.baseCopyStyleName,
+    baseCopyMatrix: item.copy.baseCopyMatrix,
     fromEmail: item.sender.from_email,
     recipients: item.recipients,
     totalRecipients: item.totalRecipients,
@@ -724,6 +801,8 @@ async function main() {
         subject: item.copy.subject,
         copySource: item.copy.source,
         copyTopic: item.copy.topic,
+        baseCopyStyle: item.copy.baseCopyStyle,
+        baseCopyStyleName: item.copy.baseCopyStyleName,
         fromEmail: item.sender.from_email,
         recipients: item.recipients,
         totalRecipients: item.totalRecipients,
