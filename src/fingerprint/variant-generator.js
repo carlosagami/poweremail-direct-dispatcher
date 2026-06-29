@@ -155,6 +155,63 @@ function getSubject(campaign) {
   return String(campaign.subject || campaign.title || "");
 }
 
+function normalizeSubjectForComparison(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function variantSubjectUnchanged(originalSubject, variantSubject) {
+  const original = normalizeSubjectForComparison(originalSubject);
+  const variant = normalizeSubjectForComparison(variantSubject);
+  return Boolean(original && variant && original === variant);
+}
+
+function fallbackVariantSubject(input, variant, attempt) {
+  const options = [
+    "Nota breve",
+    "Un comentario",
+    "Punto para revisar",
+    "Referencia corta",
+    "Lo dejo ubicado",
+    "Detalle suelto",
+    "Apunte rapido",
+    "Contexto breve",
+  ];
+  const seed = [
+    input.tenantKey || "unknown",
+    input.fromEmail || "unknown",
+    input.subject || "",
+    variant.copy_intent_type || "",
+    attempt,
+  ].join(":");
+
+  let subject = options[hashInt(seed) % options.length];
+  if (variantSubjectUnchanged(input.subject, subject)) {
+    subject = options[(hashInt(`${seed}:fallback`) + 1) % options.length];
+  }
+  return subject;
+}
+
+function ensureVariantSubjectChanged(input, variant, attempt) {
+  if (!variantSubjectUnchanged(input.subject, variant.variant_subject)) {
+    return variant;
+  }
+
+  const changedLayers = Array.isArray(variant.changed_layers)
+    ? Array.from(new Set([...variant.changed_layers, "subject"]))
+    : ["subject"];
+
+  return {
+    ...variant,
+    variant_subject: fallbackVariantSubject(input, variant, attempt),
+    changed_layers: changedLayers,
+  };
+}
+
 function variantsEnabled(config) {
   return boolValue(config.fingerprintVariantsEnabled);
 }
@@ -354,6 +411,7 @@ async function callOpenAI(config, input, feedback) {
               required_variation_matrix: input.variationContract.copy_variation_matrix,
               hard_constraints: [
                 "Do not sound like a seller, SDR, cold outreach tool, prospecting sequence, or newsletter.",
+                "The variant_subject must be different from the original_subject, while staying natural and non-promotional.",
                 "Avoid: Hola, Observe, Vi que, Note que, He estado revisando, Me llamo la atencion.",
                 "Avoid: Como manejan actualmente, Han considerado, Te interesaria, Estarias abierto a.",
                 "Avoid: Si tiene sentido, Si te parece util, Quedo atento, Espero tus comentarios, Saludos cordiales.",
@@ -416,7 +474,8 @@ async function generateFingerprintVariant(config, campaign, context = {}) {
 
   for (let attempt = 1; attempt <= maxAttempts(config); attempt += 1) {
     input.variationContract = buildVariationMatrix(input, attempt);
-    const variant = await callOpenAI(config, input, feedback);
+    const generatedVariant = await callOpenAI(config, input, feedback);
+    const variant = ensureVariantSubjectChanged(input, generatedVariant, attempt);
     if (!variant.safe_to_send) {
       feedback = { safe_to_send: false, risk_notes: variant.risk_notes || "" };
       continue;
