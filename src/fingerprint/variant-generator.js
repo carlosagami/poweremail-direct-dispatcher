@@ -4,22 +4,22 @@ const crypto = require("crypto");
 const { validateFingerprintVariant } = require("./similarity-validator");
 
 const COPY_INTENT_TYPES = [
+  "casual_observation",
   "brief_human_note_no_cta",
-  "single_line_specific_question",
-  "soft_reflective_message",
-  "contextual_follow_up_no_sale",
-  "operational_or_logistical_comment",
-  "process_observation",
-  "courtesy_message",
-  "micro_consultation",
-  "longer_personal_explanation",
-  "casual_direct_message",
-  "formal_sober_message",
-  "collaborative_message",
+  "neutral_context_note",
+  "process_comment",
+  "quiet_reflection",
+  "operational_aside",
+  "simple_acknowledgement",
+  "informal_continuation",
+  "one_line_thought",
+  "low_energy_note",
+  "direct_non_sales_comment",
+  "context_clarification",
+  "human_reaction",
   "no_question_message",
-  "one_question_message",
+  "no_close_message",
   "minimal_close_message",
-  "no_traditional_close_message",
   "short_signature_message",
   "full_signature_message",
   "no_benefit_language_message",
@@ -27,23 +27,28 @@ const COPY_INTENT_TYPES = [
 ];
 
 const VARIATION_AXES = {
-  opening: ["no_salutation", "first_person_note", "context_first", "direct_observation", "brief_courtesy"],
+  opening: ["no_salutation", "direct_context", "fragment", "first_person_note", "neutral_statement"],
   length: ["very_short", "short", "medium", "long"],
-  tone: ["casual_direct", "formal_sober", "collaborative", "soft_reflective", "operational", "courteous"],
-  cta: ["none", "soft", "direct"],
+  tone: ["casual_direct", "formal_sober", "quiet", "reflective", "operational", "plain"],
+  cta: ["none", "soft"],
   structure: [
     "single_line",
     "one_paragraph",
     "two_short_paragraphs",
+    "fragmented_note",
     "operational_note",
-    "personal_explanation",
     "no_traditional_close",
   ],
   closing: ["none", "minimal", "natural_sentence", "short_signature", "full_signature"],
   brand_presence: ["absent", "indirect", "present"],
   product_presence: ["absent", "indirect", "present"],
-  question_presence: ["none", "one_simple_question", "contextual_question"],
+  question_presence: ["none", "one_simple_question"],
   personalization_level: ["low", "medium", "high"],
+  energy: ["low", "medium", "matter_of_fact"],
+  rhythm: ["single_breath", "broken", "plain", "as_if_from_phone"],
+  punctuation: ["plain", "minimal", "fragmented"],
+  first_person: ["absent", "light", "present"],
+  formality: ["informal", "neutral", "formal"],
 };
 
 function optionalString(value) {
@@ -80,32 +85,36 @@ function buildVariationMatrix(input, attempt) {
     matrix[axis] = pick(options, `${seed}:${axis}`);
   }
 
-  if (intentType.includes("no_cta") || intentType.includes("no_question") || intentType.includes("courtesy")) {
-    matrix.cta = "none";
-  }
-  if (intentType.includes("one_question") || intentType.includes("question")) {
+  matrix.cta = "none";
+  matrix.question_presence = "none";
+
+  if (intentType === "context_clarification" || intentType === "human_reaction") {
     matrix.question_presence = "one_simple_question";
+    matrix.cta = "soft";
   }
-  if (intentType.includes("no_question")) {
-    matrix.question_presence = "none";
-  }
-  if (intentType.includes("no_traditional_close")) {
+  if (intentType.includes("no_close") || intentType === "one_line_thought") {
     matrix.closing = "none";
-    matrix.structure = "no_traditional_close";
+    matrix.structure = intentType === "one_line_thought" ? "single_line" : "no_traditional_close";
   }
   if (intentType.includes("formal")) {
     matrix.tone = "formal_sober";
+    matrix.formality = "formal";
   }
-  if (intentType.includes("casual")) {
+  if (intentType.includes("casual") || intentType.includes("informal")) {
     matrix.tone = "casual_direct";
+    matrix.formality = "informal";
   }
   if (intentType.includes("longer")) {
     matrix.length = "long";
-    matrix.structure = "personal_explanation";
   }
-  if (intentType.includes("single_line")) {
+  if (intentType.includes("one_line")) {
     matrix.length = "very_short";
     matrix.structure = "single_line";
+    matrix.closing = "none";
+  }
+  if (intentType === "low_energy_note") {
+    matrix.energy = "low";
+    matrix.cta = "none";
   }
 
   return {
@@ -254,13 +263,13 @@ function variantSchema() {
       variant_strategy: {
         type: "string",
         enum: [
-          "new_angle",
-          "softer_cta",
-          "technical_probe",
-          "reply_only",
           "human_note",
+          "casual_observation",
+          "neutral_note",
           "operational_note",
+          "quiet_reflection",
           "contextual_follow_up",
+          "reply_like",
         ],
       },
       copy_intent_type: {
@@ -287,6 +296,11 @@ function variantSchema() {
             "question_presence",
             "brand_presence",
             "product_presence",
+            "energy",
+            "rhythm",
+            "punctuation",
+            "first_person",
+            "formality",
           ],
         },
       },
@@ -325,12 +339,12 @@ async function callOpenAI(config, input, feedback) {
           {
             role: "system",
             content:
-              "You create safe PowerEmail deliverability probe variants for Microsoft 365/Defender testing. These are non-commercial diagnostic, warmup, and initial-conversation emails. Preserve the broad business context, but produce genuinely different human-written copy with a distinct structure, rhythm, opening, length, tone, CTA level, closing, and intent. Do not spin synonyms. Do not add links, attachments, urgency, discounts, promotions, grand claims, fake personal knowledge, deceptive wording, pressure, newsletter language, or aggressive prospecting. Avoid repeated openings like 'Hola' and repeated closings like 'Quedo atento'. Return only the structured output.",
+              "Create safe PowerEmail deliverability probe variants for Microsoft 365/Defender testing. The goal is NOT better SDR copy. The goal is ordinary human communication that is least identifiable as automated prospecting. Avoid the cold-outreach pattern: greeting, company observation, proof of research, exploratory question, invitation to talk, cordial close. Many messages should have no question, no CTA, no invitation, no sales intent, and no traditional close. Some may start without a greeting, be one sentence, feel like a quick note, a context remark, a casual observation, an internal-style note, a human reaction, or a continuation of a conversation. Never use urgency, discounts, promotions, grand claims, fake personal knowledge, pressure, newsletter language, or sales-development wording. Return only the structured output.",
           },
           {
             role: "user",
             content: JSON.stringify({
-              task: "Create one distinct variant for a reserve or standby deliverability probe.",
+              task: "Create one non-SDR, human-normal variant for a reserve or standby deliverability probe.",
               original_subject: input.subject,
               original_body: input.body,
               tenant_key: input.tenantKey,
@@ -339,17 +353,18 @@ async function callOpenAI(config, input, feedback) {
               required_copy_intent_type: input.variationContract.copy_intent_type,
               required_variation_matrix: input.variationContract.copy_variation_matrix,
               hard_constraints: [
+                "Do not sound like a seller, SDR, cold outreach tool, prospecting sequence, or newsletter.",
+                "Avoid: Hola, Observe, Vi que, Note que, He estado revisando, Me llamo la atencion.",
+                "Avoid: Como manejan actualmente, Han considerado, Te interesaria, Estarias abierto a.",
+                "Avoid: Si tiene sentido, Si te parece util, Quedo atento, Espero tus comentarios, Saludos cordiales.",
                 "No urgency language.",
                 "No gratis/oferta/promocion/descuento/ultima oportunidad.",
                 "No grand claims.",
                 "No links unless the original explicitly had links; do not add new URLs.",
                 "No attachments.",
-                "No newsletter tone.",
-                "No mass-campaign tone.",
-                "No aggressive sales sequence tone.",
-                "No more than one question.",
-                "CTA must match the required cta axis.",
-                "Body must match the required structure and length axis.",
+                "No more than one question; prefer no question unless the matrix requires one.",
+                "No explicit invitation unless the matrix CTA is soft; never make a meeting/demo CTA.",
+                "Before returning, ask: does this look like automated cold outreach? If yes, rewrite it.",
               ],
               previous_validation_feedback: feedback || null,
             }),
