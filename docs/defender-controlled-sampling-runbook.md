@@ -28,9 +28,28 @@ With 5 configured brands, expected volume is:
 - weekdays recipient exposure: 5-20 recipient deliveries per day
 - weekends recipient exposure: 5-10 recipient deliveries per day
 
-## Pre-production dry-run
+## Local preflight without production secrets
 
-Run plan mode before approving production:
+Run this first from a local checkout. It does not require `CONTROL_PLANE_DATABASE_URL`, does not read recipients, does not generate copy and cannot hand off:
+
+```bash
+npm run orchestrate:test:config-plan
+```
+
+Expected evidence:
+
+- `mode=config-plan`
+- `requiresDatabase=false`
+- `canHandoff=false`
+- `sendVolume.weekdays.minPerBrand=1`
+- `sendVolume.weekdays.maxPerBrand=2`
+- or on weekend, `sendVolume.weekends.minPerBrand=1` and `maxPerBrand=1`
+- `recipientCohorts.minRecipientsPerSlot=1`
+- `recipientCohorts.maxRecipientsPerSlot=2`
+
+## Environment plan mode
+
+Run plan mode in the target environment before approving production:
 
 ```bash
 TEST_ORCHESTRATOR_MODE=plan \
