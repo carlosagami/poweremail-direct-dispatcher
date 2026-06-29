@@ -1,7 +1,43 @@
 "use strict";
 
 const { buildContentFingerprints } = require("./fingerprint");
-const { normalizeBody, normalizeSubject } = require("./normalizer");
+const {
+  extractUrlDomains,
+  normalizeBody,
+  normalizeSubject,
+} = require("./normalizer");
+
+const EMAIL_ADDRESS_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const QUESTION_PATTERN = /[?¿]/g;
+const URL_PATTERN = /\bhttps?:\/\/\S+/i;
+
+const FORBIDDEN_TERMS = [
+  "gratis",
+  "oferta",
+  "promocion",
+  "promoción",
+  "descuento",
+  "ultima oportunidad",
+  "última oportunidad",
+  "urgente",
+  "aprovecha ahora",
+  "solo por hoy",
+  "garantizado",
+  "imperdible",
+];
+
+const REQUIRED_MATRIX_AXES = [
+  "opening",
+  "length",
+  "tone",
+  "cta",
+  "structure",
+  "closing",
+  "brand_presence",
+  "product_presence",
+  "question_presence",
+  "personalization_level",
+];
 
 function clampNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -80,6 +116,75 @@ function getSubject(campaign) {
   return String(campaign.subject || campaign.title || "");
 }
 
+function sourceJson(campaign) {
+  const raw = campaign.source_json || campaign.sourceJson || {};
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+function normalizeForTermChecks(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function includesForbiddenTerms(value) {
+  const normalized = normalizeForTermChecks(value);
+  return FORBIDDEN_TERMS.filter((term) => normalized.includes(normalizeForTermChecks(term)));
+}
+
+function countQuestions(value) {
+  return (String(value || "").match(QUESTION_PATTERN) || []).length;
+}
+
+function paragraphCount(value) {
+  return String(value || "")
+    .trim()
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean).length;
+}
+
+function wordCount(value) {
+  return tokenize(value).length;
+}
+
+function lengthBucket(count) {
+  if (count <= 12) return "very_short";
+  if (count <= 45) return "short";
+  if (count <= 110) return "medium";
+  return "long";
+}
+
+function hasTemplateOpening(value) {
+  return /^\s*(hola|buenos dias|buenos días|buenas tardes|buen dia|buen día)\b/i.test(
+    String(value || "")
+  );
+}
+
+function hasTemplateClosing(value) {
+  return /(quedo atento|quedo atenta|quedamos atentos|saludos cordiales|cordialmente)\.?\s*$/i.test(
+    String(value || "").trim()
+  );
+}
+
+function hasValidVariationMatrix(matrix) {
+  return Boolean(
+    matrix &&
+      typeof matrix === "object" &&
+      !Array.isArray(matrix) &&
+      REQUIRED_MATRIX_AXES.every((axis) => typeof matrix[axis] === "string" && matrix[axis].length > 0)
+  );
+}
+
+function hasNoNewUrls(originalBody, variantBody) {
+  const originalDomains = new Set(extractUrlDomains(originalBody));
+  const variantDomains = extractUrlDomains(variantBody);
+  if (variantDomains.length === 0) return true;
+  if (originalDomains.size === 0) return false;
+  return variantDomains.every((domain) => originalDomains.has(domain));
+}
+
 function validateFingerprintVariant(originalCampaign, variantCampaign, config = {}) {
   const maxAllowedNgramOverlap = clampNumber(
     config.fingerprintVariantMaxNgramOverlap,
@@ -100,12 +205,20 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
 
   const originalSubject = normalizeSubject(getSubject(originalCampaign));
   const variantSubject = normalizeSubject(getSubject(variantCampaign));
-  const originalBody = normalizeBody(getBody(originalCampaign));
-  const variantBody = normalizeBody(getBody(variantCampaign));
+  const originalBodyRaw = getBody(originalCampaign);
+  const variantBodyRaw = getBody(variantCampaign);
+  const originalBody = normalizeBody(originalBodyRaw);
+  const variantBody = normalizeBody(variantBodyRaw);
   const originalFingerprints = buildContentFingerprints(originalCampaign);
   const variantFingerprints = buildContentFingerprints(variantCampaign);
   const ngramOverlap = maxNgramOverlap(originalBody, variantBody);
   const first200Overlap = firstWindowOverlap(originalBody, variantBody, 200);
+  const originalWordCount = wordCount(originalBodyRaw);
+  const variantWordCount = wordCount(variantBodyRaw);
+  const originalParagraphCount = paragraphCount(originalBodyRaw);
+  const variantParagraphCount = paragraphCount(variantBodyRaw);
+  const variantSourceJson = sourceJson(variantCampaign);
+  const variationMatrix = variantSourceJson.fingerprint_variant_matrix || null;
   const changedLayers = [];
 
   if (originalSubject && variantSubject && originalSubject !== variantSubject) {
@@ -127,6 +240,18 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
   if (first200Overlap <= maxAllowedFirstWindowOverlap) {
     changedLayers.push("opening");
   }
+  if (lengthBucket(originalWordCount) !== lengthBucket(variantWordCount)) {
+    changedLayers.push("length");
+  }
+  if (originalParagraphCount !== variantParagraphCount) {
+    changedLayers.push("paragraph_count");
+  }
+
+  const combinedVariantText = `${getSubject(variantCampaign)}\n${variantBodyRaw}`;
+  const forbiddenTerms = includesForbiddenTerms(combinedVariantText);
+  const questionCount = countQuestions(variantBodyRaw);
+  const hasEmailAddress = EMAIL_ADDRESS_PATTERN.test(combinedVariantText);
+  const hasUrl = URL_PATTERN.test(combinedVariantText);
 
   const checks = {
     subjectChanged: Boolean(originalSubject && variantSubject && originalSubject !== variantSubject),
@@ -137,6 +262,27 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
     maxAllowedNgramOverlap,
     first200Overlap,
     maxAllowedFirstWindowOverlap,
+    originalWordCount,
+    variantWordCount,
+    originalLengthBucket: lengthBucket(originalWordCount),
+    variantLengthBucket: lengthBucket(variantWordCount),
+    originalParagraphCount,
+    variantParagraphCount,
+    questionCount,
+    maxAllowedQuestions: 1,
+    hasEmailAddress,
+    hasUrl,
+    noNewUrls: hasNoNewUrls(originalBodyRaw, variantBodyRaw),
+    forbiddenTerms,
+    hasTemplateOpening: hasTemplateOpening(variantBodyRaw),
+    hasTemplateClosing: hasTemplateClosing(variantBodyRaw),
+    hasVariationMatrix: hasValidVariationMatrix(variationMatrix),
+    automationRisk: variantSourceJson.fingerprint_variant_automation_risk || null,
+    ctaLevel: variantSourceJson.fingerprint_variant_cta_level || null,
+    ctaMatchesMatrix:
+      hasValidVariationMatrix(variationMatrix) &&
+      variantSourceJson.fingerprint_variant_cta_level === variationMatrix.cta,
+    intentType: variantSourceJson.fingerprint_variant_intent_type || null,
     changedLayers,
     minChangedLayers,
   };
@@ -147,6 +293,15 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
     checks.contentFingerprintChanged &&
     checks.ngramOverlap <= checks.maxAllowedNgramOverlap &&
     checks.first200Overlap <= checks.maxAllowedFirstWindowOverlap &&
+    checks.questionCount <= checks.maxAllowedQuestions &&
+    !checks.hasEmailAddress &&
+    checks.noNewUrls &&
+    checks.forbiddenTerms.length === 0 &&
+    !checks.hasTemplateClosing &&
+    checks.hasVariationMatrix &&
+    checks.ctaMatchesMatrix &&
+    checks.automationRisk !== "high" &&
+    Boolean(checks.intentType) &&
     changedLayers.length >= minChangedLayers;
 
   return {
