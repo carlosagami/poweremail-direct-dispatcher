@@ -1,6 +1,50 @@
 "use strict";
 
+const crypto = require("crypto");
 const { validateFingerprintVariant } = require("./similarity-validator");
+
+const COPY_INTENT_TYPES = [
+  "brief_human_note_no_cta",
+  "single_line_specific_question",
+  "soft_reflective_message",
+  "contextual_follow_up_no_sale",
+  "operational_or_logistical_comment",
+  "process_observation",
+  "courtesy_message",
+  "micro_consultation",
+  "longer_personal_explanation",
+  "casual_direct_message",
+  "formal_sober_message",
+  "collaborative_message",
+  "no_question_message",
+  "one_question_message",
+  "minimal_close_message",
+  "no_traditional_close_message",
+  "short_signature_message",
+  "full_signature_message",
+  "no_benefit_language_message",
+  "no_sales_words_message",
+];
+
+const VARIATION_AXES = {
+  opening: ["no_salutation", "first_person_note", "context_first", "direct_observation", "brief_courtesy"],
+  length: ["very_short", "short", "medium", "long"],
+  tone: ["casual_direct", "formal_sober", "collaborative", "soft_reflective", "operational", "courteous"],
+  cta: ["none", "soft", "direct"],
+  structure: [
+    "single_line",
+    "one_paragraph",
+    "two_short_paragraphs",
+    "operational_note",
+    "personal_explanation",
+    "no_traditional_close",
+  ],
+  closing: ["none", "minimal", "natural_sentence", "short_signature", "full_signature"],
+  brand_presence: ["absent", "indirect", "present"],
+  product_presence: ["absent", "indirect", "present"],
+  question_presence: ["none", "one_simple_question", "contextual_question"],
+  personalization_level: ["low", "medium", "high"],
+};
 
 function optionalString(value) {
   if (value === null || value === undefined) return null;
@@ -12,12 +56,70 @@ function boolValue(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
 }
 
+function hashInt(input) {
+  const digest = crypto.createHash("sha256").update(String(input)).digest();
+  return digest.readUInt32BE(0);
+}
+
+function pick(options, seed) {
+  return options[hashInt(seed) % options.length];
+}
+
+function buildVariationMatrix(input, attempt) {
+  const seed = [
+    input.tenantKey || "unknown",
+    input.fromEmail || "unknown",
+    input.domainRole || "unknown",
+    input.subject || "",
+    attempt,
+  ].join(":");
+  const intentType = COPY_INTENT_TYPES[hashInt(`${seed}:intent`) % COPY_INTENT_TYPES.length];
+  const matrix = {};
+
+  for (const [axis, options] of Object.entries(VARIATION_AXES)) {
+    matrix[axis] = pick(options, `${seed}:${axis}`);
+  }
+
+  if (intentType.includes("no_cta") || intentType.includes("no_question") || intentType.includes("courtesy")) {
+    matrix.cta = "none";
+  }
+  if (intentType.includes("one_question") || intentType.includes("question")) {
+    matrix.question_presence = "one_simple_question";
+  }
+  if (intentType.includes("no_question")) {
+    matrix.question_presence = "none";
+  }
+  if (intentType.includes("no_traditional_close")) {
+    matrix.closing = "none";
+    matrix.structure = "no_traditional_close";
+  }
+  if (intentType.includes("formal")) {
+    matrix.tone = "formal_sober";
+  }
+  if (intentType.includes("casual")) {
+    matrix.tone = "casual_direct";
+  }
+  if (intentType.includes("longer")) {
+    matrix.length = "long";
+    matrix.structure = "personal_explanation";
+  }
+  if (intentType.includes("single_line")) {
+    matrix.length = "very_short";
+    matrix.structure = "single_line";
+  }
+
+  return {
+    copy_intent_type: intentType,
+    copy_variation_matrix: matrix,
+  };
+}
+
 function escapeHtml(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
+    .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
 
@@ -75,6 +177,11 @@ function buildVariantCampaign(campaign, variant, metadata) {
     fingerprint_variant_model: metadata.model,
     fingerprint_variant_attempt: metadata.attempt,
     fingerprint_variant_parent_event_id: metadata.parentFingerprintEventId || null,
+    fingerprint_variant_intent_type: variant.copy_intent_type,
+    fingerprint_variant_cta_level: variant.cta_level,
+    fingerprint_variant_automation_risk: variant.automation_risk,
+    fingerprint_variant_deliverability_notes: variant.deliverability_notes,
+    fingerprint_variant_matrix: variant.copy_variation_matrix,
   };
   const variantSourceJson = {
     ...(sourceJson && typeof sourceJson === "object" && !Array.isArray(sourceJson) ? sourceJson : {}),
@@ -108,6 +215,22 @@ function responseText(payload) {
   return chunks.join("\n").trim();
 }
 
+function variationMatrixSchema() {
+  const properties = {};
+  const required = Object.keys(VARIATION_AXES);
+
+  for (const [axis, options] of Object.entries(VARIATION_AXES)) {
+    properties[axis] = { type: "string", enum: options };
+  }
+
+  return {
+    type: "object",
+    additionalProperties: false,
+    required,
+    properties,
+  };
+}
+
 function variantSchema() {
   return {
     type: "object",
@@ -116,8 +239,12 @@ function variantSchema() {
       "variant_subject",
       "variant_body",
       "variant_strategy",
-      "cta_type",
+      "copy_intent_type",
+      "copy_variation_matrix",
+      "cta_level",
       "changed_layers",
+      "automation_risk",
+      "deliverability_notes",
       "risk_notes",
       "safe_to_send",
     ],
@@ -126,19 +253,48 @@ function variantSchema() {
       variant_body: { type: "string" },
       variant_strategy: {
         type: "string",
-        enum: ["new_angle", "softer_cta", "technical_probe", "reply_only"],
+        enum: [
+          "new_angle",
+          "softer_cta",
+          "technical_probe",
+          "reply_only",
+          "human_note",
+          "operational_note",
+          "contextual_follow_up",
+        ],
       },
-      cta_type: {
+      copy_intent_type: {
         type: "string",
-        enum: ["none_or_soft", "reply_only", "meeting_booking", "click_cta"],
+        enum: COPY_INTENT_TYPES,
+      },
+      copy_variation_matrix: variationMatrixSchema(),
+      cta_level: {
+        type: "string",
+        enum: ["none", "soft", "direct"],
       },
       changed_layers: {
         type: "array",
         items: {
           type: "string",
-          enum: ["subject", "opening", "structure", "cta", "length", "tone"],
+          enum: [
+            "subject",
+            "opening",
+            "structure",
+            "cta",
+            "length",
+            "tone",
+            "closing",
+            "question_presence",
+            "brand_presence",
+            "product_presence",
+          ],
         },
       },
+      automation_risk: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+      },
+      deliverability_notes: { type: "string" },
       risk_notes: { type: "string" },
       safe_to_send: { type: "boolean" },
     },
@@ -169,17 +325,32 @@ async function callOpenAI(config, input, feedback) {
           {
             role: "system",
             content:
-              "You create safe PowerEmail deliverability probe variants. Preserve the business intent, but change subject, opening, structure and CTA enough to avoid repeated content fingerprints. Do not add misleading claims, fake personal knowledge, or aggressive language. Return only the structured output.",
+              "You create safe PowerEmail deliverability probe variants for Microsoft 365/Defender testing. These are non-commercial diagnostic, warmup, and initial-conversation emails. Preserve the broad business context, but produce genuinely different human-written copy with a distinct structure, rhythm, opening, length, tone, CTA level, closing, and intent. Do not spin synonyms. Do not add links, attachments, urgency, discounts, promotions, grand claims, fake personal knowledge, deceptive wording, pressure, newsletter language, or aggressive prospecting. Avoid repeated openings like 'Hola' and repeated closings like 'Quedo atento'. Return only the structured output.",
           },
           {
             role: "user",
             content: JSON.stringify({
-              task: "Create a distinct variant for a reserve or standby deliverability probe.",
+              task: "Create one distinct variant for a reserve or standby deliverability probe.",
               original_subject: input.subject,
               original_body: input.body,
               tenant_key: input.tenantKey,
               from_email: input.fromEmail,
               domain_role: input.domainRole,
+              required_copy_intent_type: input.variationContract.copy_intent_type,
+              required_variation_matrix: input.variationContract.copy_variation_matrix,
+              hard_constraints: [
+                "No urgency language.",
+                "No gratis/oferta/promocion/descuento/ultima oportunidad.",
+                "No grand claims.",
+                "No links unless the original explicitly had links; do not add new URLs.",
+                "No attachments.",
+                "No newsletter tone.",
+                "No mass-campaign tone.",
+                "No aggressive sales sequence tone.",
+                "No more than one question.",
+                "CTA must match the required cta axis.",
+                "Body must match the required structure and length axis.",
+              ],
               previous_validation_feedback: feedback || null,
             }),
           },
@@ -229,6 +400,7 @@ async function generateFingerprintVariant(config, campaign, context = {}) {
   let feedback = null;
 
   for (let attempt = 1; attempt <= maxAttempts(config); attempt += 1) {
+    input.variationContract = buildVariationMatrix(input, attempt);
     const variant = await callOpenAI(config, input, feedback);
     if (!variant.safe_to_send) {
       feedback = { safe_to_send: false, risk_notes: variant.risk_notes || "" };
