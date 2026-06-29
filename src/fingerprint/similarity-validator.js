@@ -279,6 +279,9 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
     hasVariationMatrix: hasValidVariationMatrix(variationMatrix),
     automationRisk: variantSourceJson.fingerprint_variant_automation_risk || null,
     ctaLevel: variantSourceJson.fingerprint_variant_cta_level || null,
+    ctaMatchesMatrix:
+      hasValidVariationMatrix(variationMatrix) &&
+      variantSourceJson.fingerprint_variant_cta_level === variationMatrix.cta,
     intentType: variantSourceJson.fingerprint_variant_intent_type || null,
     changedLayers,
     minChangedLayers,
@@ -296,7 +299,9 @@ function validateFingerprintVariant(originalCampaign, variantCampaign, config = 
     checks.forbiddenTerms.length === 0 &&
     !checks.hasTemplateClosing &&
     checks.hasVariationMatrix &&
+    checks.ctaMatchesMatrix &&
     checks.automationRisk !== "high" &&
+    Boolean(checks.intentType) &&
     changedLayers.length >= minChangedLayers;
 
   return {
