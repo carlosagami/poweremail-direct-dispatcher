@@ -20,4 +20,7 @@ export TEST_ORCHESTRATOR_DISPATCHER_URL="${TEST_ORCHESTRATOR_DISPATCHER_URL:-htt
 # Keep the salt stable per Mexico City calendar day to prevent accidental duplicate campaigns.
 export TEST_ORCHESTRATOR_ID_SALT="${TEST_ORCHESTRATOR_ID_SALT:-daily-$(TZ=America/Mexico_City date +%Y%m%d)}"
 
-exec node -r ./src/test-mail-copy-ai-guard.js src/test-mail-orchestrator.js
+exec node \
+  -r ./src/test-mail-copy-ai-guard.js \
+  -r ./src/test-mail-local-copy-quality-guard.js \
+  src/test-mail-orchestrator.js
