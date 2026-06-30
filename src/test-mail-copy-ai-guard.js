@@ -7,6 +7,7 @@ const FORBIDDEN_COPY_PATTERNS = [
   /\bobserv[eé]/i,
   /\bvi que\b/i,
   /\bnot[eé] que\b/i,
+  /\bhe notado\b/i,
   /\bhe estado revisando\b/i,
   /\bme llam[oó] la atenci[oó]n\b/i,
   /\bc[oó]mo manejan actualmente\b/i,
@@ -21,6 +22,15 @@ const FORBIDDEN_COPY_PATTERNS = [
   /\bagenda una llamada\b/i,
   /\bte ofrecemos\b/i,
   /\bcontamos con\b/i,
+  /\bsuelen enfrentar\b/i,
+  /\bobjeciones recurrentes\b/i,
+  /\bnegociaciones de ventas\b/i,
+  /\bproceso de ventas\b/i,
+  /\bfacilitar el seguimiento\b/i,
+  /\bcerrar m[aá]s acuerdos\b/i,
+  /\bme interesa conocer\b/i,
+  /\bintercambiar ideas\b/i,
+  /\bles ayuden\b/i,
 ];
 
 const FORBIDDEN_SUBJECT_PATTERNS = [
@@ -30,6 +40,7 @@ const FORBIDDEN_SUBJECT_PATTERNS = [
   /^\s*una pregunta sobre\b/i,
   /^\s*has considerado\b/i,
   /^\s*\?has considerado\b/i,
+  /^\s*sobre las objeciones frecuentes\b/i,
 ];
 
 const CTA_PATTERNS = [
@@ -41,6 +52,9 @@ const CTA_PATTERNS = [
   /\bplaticar\b/i,
   /\bsi quieres\b/i,
   /\bsi gustas\b/i,
+  /\bme interesa\b/i,
+  /\bconocer su enfoque\b/i,
+  /\bintercambiar ideas\b/i,
 ];
 
 function parseJsonLineAfter(prompt, marker) {
