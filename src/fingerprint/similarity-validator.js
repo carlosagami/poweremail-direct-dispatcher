@@ -29,6 +29,7 @@ const FORBIDDEN_TERMS = [
   "vi que",
   "note que",
   "noté que",
+  "he notado",
   "he estado revisando",
   "me llamo la atencion",
   "me llamó la atención",
