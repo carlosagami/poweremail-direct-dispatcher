@@ -21,8 +21,9 @@
     "check:orchestrate-test": "node --check src/test-mail-orchestrator.js && node --check src/test-mail-copy-ai-guard.js && node --check src/test-mail-local-copy-quality-guard.js",
     "check:orchestrate-test-config-plan": "node --check scripts/preview-test-orchestrator-config.js",
     "check:fingerprint-variant": "node --check src/fingerprint/variant-generator.js && node --check src/fingerprint/similarity-validator.js",
+    "check:recipient-queue-guard": "node --check src/recipient-queue-conflict-guard.js",
     "check:orchestrate-test:cron": "bash -n scripts/run-test-orchestrator-cron.sh",
-    "start": "node -r ./src/worker-loop.js src/server.js"
+    "start": "node -r ./src/recipient-queue-conflict-guard.js -r ./src/worker-loop.js src/server.js"
   },
   "dependencies": {
     "mysql2": "^3.11.3",
