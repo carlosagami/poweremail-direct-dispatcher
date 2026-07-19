@@ -65,6 +65,14 @@ function loadServiceConfig() {
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
     maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
     maxRecipientsPerRun: intEnv("DIRECT_DISPATCHER_MAX_RECIPIENTS_PER_RUN", 25),
+    smtpPoolEnabled: boolEnv("DIRECT_DISPATCHER_SMTP_POOL_ENABLED", true),
+    smtpMaxConnections: intEnv("DIRECT_DISPATCHER_SMTP_MAX_CONNECTIONS", 1),
+    smtpMaxMessages: intEnv("DIRECT_DISPATCHER_SMTP_MAX_MESSAGES", 500),
+    progressEveryNRecipients: intEnv(
+      "DIRECT_DISPATCHER_PROGRESS_EVERY_N_RECIPIENTS",
+      25
+    ),
+    batchHeartbeatMs: intEnv("DIRECT_DISPATCHER_BATCH_HEARTBEAT_MS", 30000),
     staleBatchTimeoutMs: intEnv(
       "DIRECT_DISPATCHER_STALE_BATCH_TIMEOUT_MS",
       5 * 60 * 1000

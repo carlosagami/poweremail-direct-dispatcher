@@ -52,6 +52,14 @@ function getSendDelayMs(config) {
   return Math.ceil(1000 / Math.max(rate, 0.1));
 }
 
+function getProgressEveryNRecipients(config) {
+  return Math.max(Number(config.progressEveryNRecipients || 25), 1);
+}
+
+function getBatchHeartbeatMs(config) {
+  return Math.max(Number(config.batchHeartbeatMs || 30000), 1000);
+}
+
 function isBatchEmptyError(err) {
   return err?.message === BATCH_EMPTY_ERROR_MESSAGE;
 }
@@ -140,7 +148,9 @@ function escapeDisplayName(displayName) {
 }
 
 function formatFromHeader(content, fallbackFromEmail, overrideFromEmail = null) {
-  const fromEmail = String(overrideFromEmail || content.from_email || fallbackFromEmail || "").trim();
+  const fromEmail = String(
+    overrideFromEmail || content.from_email || fallbackFromEmail || ""
+  ).trim();
   const fromName = escapeDisplayName(content.from_name);
 
   if (fromName && fromEmail) {
@@ -155,7 +165,9 @@ function parseRecipientCustomFields(value) {
   if (typeof value === "object" && !Array.isArray(value)) return value;
   try {
     const parsed = JSON.parse(String(value));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : {};
   } catch (_) {
     return {};
   }
@@ -335,7 +347,8 @@ async function reconcileDispatchWithoutQueuedBatch(client, queueRow) {
 
   return {
     action: "completed",
-    message: "Dispatch has no queued batch because all batches are already complete",
+    message:
+      "Dispatch has no queued batch because all batches are already complete",
     state: {
       total_batches: totalBatches,
       failed_batches: failedBatches,
@@ -602,7 +615,16 @@ async function loadRecipients(cpDb, dispatchCampaignId, batchKey, limit) {
   return rows;
 }
 
-async function markAttempt(db, batch, tenantId, executionMode, resultStatus, code, message, payload) {
+async function markAttempt(
+  db,
+  batch,
+  tenantId,
+  executionMode,
+  resultStatus,
+  code,
+  message,
+  payload
+) {
   const { rows } = await db.query(
     `
     INSERT INTO control_plane.campaign_delivery_attempts (
@@ -643,7 +665,14 @@ async function markAttempt(db, batch, tenantId, executionMode, resultStatus, cod
   return rows[0].delivery_attempt_id;
 }
 
-async function updateAttempt(db, deliveryAttemptId, resultStatus, code, message, payload) {
+async function updateAttempt(
+  db,
+  deliveryAttemptId,
+  resultStatus,
+  code,
+  message,
+  payload
+) {
   await db.query(
     `
     UPDATE control_plane.campaign_delivery_attempts
@@ -674,7 +703,13 @@ async function touchBatchProgress(db, batch) {
   );
 }
 
-async function recordSmtpRelayProgress(db, batch, deliveryAttemptId, sentCount, plannedCount) {
+async function recordSmtpRelayProgress(
+  db,
+  batch,
+  deliveryAttemptId,
+  sentCount,
+  plannedCount
+) {
   await updateAttempt(
     db,
     deliveryAttemptId,
@@ -689,7 +724,6 @@ async function recordSmtpRelayProgress(db, batch, deliveryAttemptId, sentCount, 
       batch_size: batch.batch_size,
     }
   );
-  await touchBatchProgress(db, batch);
 }
 
 async function requeueBatchForShutdown(db, batch) {
@@ -1051,10 +1085,18 @@ async function executeDryRun(cpDb, batch, recipients) {
 }
 
 async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
+  const progressEvery = getProgressEveryNRecipients(config);
+  const heartbeatMs = getBatchHeartbeatMs(config);
+  const smtpPoolEnabled = Boolean(config.smtpPoolEnabled);
+  const smtpMaxConnections = Math.max(Number(config.smtpMaxConnections || 1), 1);
+  const smtpMaxMessages = Math.max(Number(config.smtpMaxMessages || 500), 1);
   const transporter = nodemailer.createTransport({
     host: config.relaySmtpHost,
     port: config.relaySmtpPort,
     secure: config.relaySmtpSecure,
+    pool: smtpPoolEnabled,
+    maxConnections: smtpMaxConnections,
+    maxMessages: smtpMaxMessages,
     auth:
       config.relaySmtpUser && config.relaySmtpPassword
         ? {
@@ -1081,6 +1123,7 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
   );
 
   let sentCount = 0;
+  let lastHeartbeatAt = Date.now();
   const plannedCount = recipients.length;
   const deliveryAttemptId = await markAttempt(
     cpDb,
@@ -1096,8 +1139,37 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       remaining: plannedCount,
       batch_key: batch.batch_key,
       batch_size: batch.batch_size,
+      smtp_pool_enabled: smtpPoolEnabled,
+      smtp_max_connections: smtpMaxConnections,
+      smtp_max_messages: smtpMaxMessages,
+      progress_every_n_recipients: progressEvery,
+      batch_heartbeat_ms: heartbeatMs,
     }
   );
+
+  async function maybeHeartbeatBatch(force = false) {
+    const now = Date.now();
+    if (!force && now - lastHeartbeatAt < heartbeatMs) {
+      return false;
+    }
+    await touchBatchProgress(cpDb, batch);
+    lastHeartbeatAt = now;
+    return true;
+  }
+
+  logger.info("relay_executor.transport_config", {
+    sendy_campaign_id: batch.sendy_campaign_id,
+    tenant_key: batch.tenant_key,
+    dispatch_campaign_id: batch.dispatch_campaign_id,
+    batch_key: batch.batch_key,
+    delivery_batch_id: batch.delivery_batch_id,
+    smtp_pool_enabled: smtpPoolEnabled,
+    smtp_max_connections: smtpMaxConnections,
+    smtp_max_messages: smtpMaxMessages,
+    progress_every_n_recipients: progressEvery,
+    batch_heartbeat_ms: heartbeatMs,
+    max_msgs_per_second: Number(config.maxMsgsPerSecond),
+  });
 
   logger.info("relay_executor.batch_started", {
     sendy_campaign_id: batch.sendy_campaign_id,
@@ -1174,18 +1246,28 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         [recipient.recipient_queue_id]
       );
 
-      await recordSmtpRelayProgress(
-        cpDb,
-        batch,
-        deliveryAttemptId,
-        sentCount,
-        plannedCount
-      );
+      const shouldPersistProgress =
+        sentCount === 1 ||
+        sentCount === plannedCount ||
+        sentCount % progressEvery === 0;
+
+      if (shouldPersistProgress) {
+        await recordSmtpRelayProgress(
+          cpDb,
+          batch,
+          deliveryAttemptId,
+          sentCount,
+          plannedCount
+        );
+        lastHeartbeatAt = Date.now();
+      } else {
+        await maybeHeartbeatBatch();
+      }
 
       if (
         sentCount === 1 ||
         sentCount === plannedCount ||
-        sentCount % 25 === 0
+        sentCount % progressEvery === 0
       ) {
         logger.info("relay_executor.batch_progress", {
           sendy_campaign_id: batch.sendy_campaign_id,
@@ -1222,6 +1304,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         batch_state: batchState,
         batch_key: batch.batch_key,
         batch_size: batch.batch_size,
+        smtp_pool_enabled: smtpPoolEnabled,
+        smtp_max_connections: smtpMaxConnections,
+        progress_every_n_recipients: progressEvery,
+        batch_heartbeat_ms: heartbeatMs,
       }
     );
 
@@ -1254,6 +1340,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
           signal: shutdownSignal,
           batch_key: batch.batch_key,
           batch_size: batch.batch_size,
+          smtp_pool_enabled: smtpPoolEnabled,
+          smtp_max_connections: smtpMaxConnections,
+          progress_every_n_recipients: progressEvery,
+          batch_heartbeat_ms: heartbeatMs,
         }
       );
 
@@ -1308,6 +1398,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
             reset_sending_recipients: recovery.resetSendingRecipients,
             control_plane_error: err.message,
             control_plane_error_code: err.code || null,
+            smtp_pool_enabled: smtpPoolEnabled,
+            smtp_max_connections: smtpMaxConnections,
+            progress_every_n_recipients: progressEvery,
+            batch_heartbeat_ms: heartbeatMs,
           }
         );
       } catch (attemptErr) {
@@ -1378,6 +1472,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
             smtp_error_code: err.code || null,
             smtp_error_command: err.command || null,
             smtp_response_code: err.responseCode || null,
+            smtp_pool_enabled: smtpPoolEnabled,
+            smtp_max_connections: smtpMaxConnections,
+            progress_every_n_recipients: progressEvery,
+            batch_heartbeat_ms: heartbeatMs,
           }
         );
       } catch (attemptErr) {
@@ -1446,6 +1544,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         remaining: Math.max(plannedCount - sentCount, 0),
         batch_key: batch.batch_key,
         batch_size: batch.batch_size,
+        smtp_pool_enabled: smtpPoolEnabled,
+        smtp_max_connections: smtpMaxConnections,
+        progress_every_n_recipients: progressEvery,
+        batch_heartbeat_ms: heartbeatMs,
       }
     );
 
@@ -1460,6 +1562,10 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       error: chunkError(err),
     });
     throw err;
+  } finally {
+    if (typeof transporter.close === "function") {
+      transporter.close();
+    }
   }
 }
 
