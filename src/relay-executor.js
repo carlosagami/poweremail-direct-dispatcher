@@ -14,6 +14,7 @@ const SMTP_RELAY_PROGRESS_CODE = "SMTP_RELAY_PROGRESS";
 const SMTP_RELAY_PARTIAL_CODE = "SMTP_RELAY_PARTIAL";
 const STALE_BATCH_REQUEUED_CODE = "STALE_BATCH_REQUEUED";
 const WORKER_SHUTDOWN_CODE = "WORKER_SHUTDOWN";
+const CONTROL_PLANE_PERSIST_RETRY_CODE = "CONTROL_PLANE_PERSIST_RETRY";
 
 let shutdownRequested = false;
 let shutdownSignal = null;
@@ -52,6 +53,45 @@ function getSendDelayMs(config) {
 
 function isBatchEmptyError(err) {
   return err?.message === BATCH_EMPTY_ERROR_MESSAGE;
+}
+
+function isControlPlaneConnectionError(err) {
+  const message = String(err?.message || "").toLowerCase();
+  const stack = String(err?.stack || "").toLowerCase();
+  const code = String(err?.code || "").toLowerCase();
+
+  if (message.includes("connection terminated unexpectedly")) {
+    return true;
+  }
+
+  if (message.includes("client has encountered a connection error")) {
+    return true;
+  }
+
+  if (message.includes("server closed the connection unexpectedly")) {
+    return true;
+  }
+
+  if (message.includes("terminating connection due to administrator command")) {
+    return true;
+  }
+
+  if (stack.includes("/pg/") && message.includes("connection terminated")) {
+    return true;
+  }
+
+  if (stack.includes("/pg/") && message.includes("connection refused")) {
+    return true;
+  }
+
+  if (
+    stack.includes("/pg/") &&
+    ["econnreset", "econnrefused", "etimedout", "epipe", "57p01", "57p02", "57p03"].includes(code)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function escapeDisplayName(displayName) {
@@ -636,6 +676,77 @@ async function requeueBatchForShutdown(db, batch) {
   );
 }
 
+async function recoverBatchAfterControlPlaneError(db, batch) {
+  return db.tx(async (client) => {
+    const { rows } = await client.query(
+      `
+      SELECT
+        count(*) FILTER (WHERE recipient_state = 'batched')::int AS batched_recipients,
+        count(*) FILTER (WHERE recipient_state = 'sending')::int AS sending_recipients
+      FROM control_plane.campaign_recipient_queue
+      WHERE dispatch_campaign_id = $1
+        AND batch_key = $2
+      `,
+      [batch.dispatch_campaign_id, batch.batch_key]
+    );
+
+    const batchedRecipients = Number(rows[0]?.batched_recipients || 0);
+    const sendingRecipients = Number(rows[0]?.sending_recipients || 0);
+
+    if (sendingRecipients > 0) {
+      await client.query(
+        `
+        UPDATE control_plane.campaign_recipient_queue
+           SET recipient_state = 'batched',
+               updated_at = now()
+         WHERE dispatch_campaign_id = $1
+           AND batch_key = $2
+           AND recipient_state = 'sending'
+        `,
+        [batch.dispatch_campaign_id, batch.batch_key]
+      );
+    }
+
+    const pendingRecipients = batchedRecipients + sendingRecipients;
+
+    if (pendingRecipients > 0) {
+      await client.query(
+        `
+        UPDATE control_plane.campaign_delivery_batches
+           SET batch_state = 'queued',
+               started_at = NULL,
+               updated_at = now()
+         WHERE delivery_batch_id = $1
+        `,
+        [batch.delivery_batch_id]
+      );
+
+      return {
+        batchState: "queued",
+        pendingRecipients,
+        resetSendingRecipients: sendingRecipients,
+      };
+    }
+
+    await client.query(
+      `
+      UPDATE control_plane.campaign_delivery_batches
+         SET batch_state = 'completed',
+             finished_at = COALESCE(finished_at, now()),
+             updated_at = now()
+       WHERE delivery_batch_id = $1
+      `,
+      [batch.delivery_batch_id]
+    );
+
+    return {
+      batchState: "completed",
+      pendingRecipients: 0,
+      resetSendingRecipients: sendingRecipients,
+    };
+  });
+}
+
 async function failBatchAndDispatch(cpDb, batch, executionMode, reason) {
   await cpDb.tx(async (client) => {
     await client.query(
@@ -1115,6 +1226,74 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         sent_before_shutdown: sentCount,
         planned: plannedCount,
         signal: shutdownSignal,
+      });
+      return;
+    }
+
+    if (isControlPlaneConnectionError(err)) {
+      let recovery = null;
+
+      try {
+        recovery = await recoverBatchAfterControlPlaneError(cpDb, batch);
+      } catch (recoveryErr) {
+        logger.error("relay_executor.batch_control_plane_recovery_failed", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          delivery_attempt_id: deliveryAttemptId,
+          sent_before_error: sentCount,
+          recovery_error: chunkError(recoveryErr),
+          original_error: chunkError(err),
+        });
+        throw err;
+      }
+
+      try {
+        await updateAttempt(
+          cpDb,
+          deliveryAttemptId,
+          "warn",
+          CONTROL_PLANE_PERSIST_RETRY_CODE,
+          `control-plane persistence interrupted after sending ${sentCount} recipients`,
+          {
+            planned: plannedCount,
+            sent_before_retry: sentCount,
+            remaining: recovery.pendingRecipients,
+            batch_state: recovery.batchState,
+            batch_key: batch.batch_key,
+            batch_size: batch.batch_size,
+            reset_sending_recipients: recovery.resetSendingRecipients,
+            control_plane_error: err.message,
+            control_plane_error_code: err.code || null,
+          }
+        );
+      } catch (attemptErr) {
+        logger.error("relay_executor.batch_control_plane_attempt_update_failed", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          delivery_attempt_id: deliveryAttemptId,
+          attempt_error: chunkError(attemptErr),
+          original_error: chunkError(err),
+        });
+      }
+
+      logger.warn("relay_executor.batch_recovered_control_plane_error", {
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
+        delivery_attempt_id: deliveryAttemptId,
+        sent_before_error: sentCount,
+        batch_state: recovery.batchState,
+        pending_recipients: recovery.pendingRecipients,
+        reset_sending_recipients: recovery.resetSendingRecipients,
+        error: chunkError(err),
       });
       return;
     }
