@@ -43,25 +43,23 @@ async function recoverOrphanedRunningBatchesOnce() {
             b.batch_size,
             r.sendy_campaign_id,
             r.tenant_key,
-            count(q.recipient_queue_id) FILTER (WHERE q.recipient_state = 'sending')::int AS sending_recipients,
-            count(q.recipient_queue_id) FILTER (WHERE q.recipient_state = 'batched')::int AS batched_recipients
+            counts.sending_recipients,
+            counts.batched_recipients
           FROM control_plane.campaign_delivery_batches b
           JOIN control_plane.sendy_campaign_registry r
             ON r.dispatch_campaign_id = b.dispatch_campaign_id
-          LEFT JOIN control_plane.campaign_recipient_queue q
-            ON q.dispatch_campaign_id = b.dispatch_campaign_id
-           AND q.batch_key = b.batch_key
+          JOIN LATERAL (
+            SELECT
+              count(*) FILTER (WHERE recipient_state = 'sending')::int AS sending_recipients,
+              count(*) FILTER (WHERE recipient_state = 'batched')::int AS batched_recipients
+            FROM control_plane.campaign_recipient_queue q
+            WHERE q.dispatch_campaign_id = b.dispatch_campaign_id
+              AND q.batch_key = b.batch_key
+          ) counts ON true
           WHERE b.batch_state = 'running'
             AND b.updated_at < now() - ($1::bigint * interval '1 millisecond')
-          GROUP BY
-            b.delivery_batch_id,
-            b.dispatch_campaign_id,
-            b.batch_key,
-            b.batch_size,
-            r.sendy_campaign_id,
-            r.tenant_key
-          HAVING count(q.recipient_queue_id) FILTER (WHERE q.recipient_state = 'sending') = 0
-             AND count(q.recipient_queue_id) FILTER (WHERE q.recipient_state = 'batched') > 0
+            AND counts.sending_recipients = 0
+            AND counts.batched_recipients > 0
           FOR UPDATE OF b SKIP LOCKED
         ),
         requeued_batches AS (
