@@ -15,6 +15,7 @@ const SMTP_RELAY_PARTIAL_CODE = "SMTP_RELAY_PARTIAL";
 const STALE_BATCH_REQUEUED_CODE = "STALE_BATCH_REQUEUED";
 const WORKER_SHUTDOWN_CODE = "WORKER_SHUTDOWN";
 const CONTROL_PLANE_PERSIST_RETRY_CODE = "CONTROL_PLANE_PERSIST_RETRY";
+const SMTP_RELAY_RETRY_CODE = "SMTP_RELAY_RETRY";
 
 let shutdownRequested = false;
 let shutdownSignal = null;
@@ -88,6 +89,46 @@ function isControlPlaneConnectionError(err) {
     stack.includes("/pg/") &&
     ["econnreset", "econnrefused", "etimedout", "epipe", "57p01", "57p02", "57p03"].includes(code)
   ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isRetryableSmtpTransportError(err) {
+  const message = String(err?.message || "").toLowerCase();
+  const code = String(err?.code || "").toLowerCase();
+  const command = String(err?.command || "").toLowerCase();
+
+  if (["econnreset", "etimedout", "esocket", "econnection", "epipe"].includes(code)) {
+    return true;
+  }
+
+  if (message.includes("socket hang up")) {
+    return true;
+  }
+
+  if (message.includes("connection timeout")) {
+    return true;
+  }
+
+  if (message.includes("connection closed unexpectedly")) {
+    return true;
+  }
+
+  if (message.includes("greeting never received")) {
+    return true;
+  }
+
+  if (message.includes("read econnreset")) {
+    return true;
+  }
+
+  if (message.includes("write epipe")) {
+    return true;
+  }
+
+  if (command === "conn" && message.includes("timeout")) {
     return true;
   }
 
@@ -1283,6 +1324,76 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       }
 
       logger.warn("relay_executor.batch_recovered_control_plane_error", {
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
+        delivery_attempt_id: deliveryAttemptId,
+        sent_before_error: sentCount,
+        batch_state: recovery.batchState,
+        pending_recipients: recovery.pendingRecipients,
+        reset_sending_recipients: recovery.resetSendingRecipients,
+        error: chunkError(err),
+      });
+      return;
+    }
+
+    if (isRetryableSmtpTransportError(err)) {
+      let recovery = null;
+
+      try {
+        recovery = await recoverBatchAfterControlPlaneError(cpDb, batch);
+      } catch (recoveryErr) {
+        logger.error("relay_executor.batch_smtp_retry_recovery_failed", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          delivery_attempt_id: deliveryAttemptId,
+          sent_before_error: sentCount,
+          recovery_error: chunkError(recoveryErr),
+          original_error: chunkError(err),
+        });
+        throw err;
+      }
+
+      try {
+        await updateAttempt(
+          cpDb,
+          deliveryAttemptId,
+          "warn",
+          SMTP_RELAY_RETRY_CODE,
+          `smtp transport interrupted after sending ${sentCount} recipients`,
+          {
+            planned: plannedCount,
+            sent_before_retry: sentCount,
+            remaining: recovery.pendingRecipients,
+            batch_state: recovery.batchState,
+            batch_key: batch.batch_key,
+            batch_size: batch.batch_size,
+            reset_sending_recipients: recovery.resetSendingRecipients,
+            smtp_error: err.message,
+            smtp_error_code: err.code || null,
+            smtp_error_command: err.command || null,
+            smtp_response_code: err.responseCode || null,
+          }
+        );
+      } catch (attemptErr) {
+        logger.error("relay_executor.batch_smtp_retry_attempt_update_failed", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+          delivery_attempt_id: deliveryAttemptId,
+          attempt_error: chunkError(attemptErr),
+          original_error: chunkError(err),
+        });
+      }
+
+      logger.warn("relay_executor.batch_recovered_smtp_transport_error", {
         sendy_campaign_id: batch.sendy_campaign_id,
         tenant_key: batch.tenant_key,
         dispatch_campaign_id: batch.dispatch_campaign_id,
