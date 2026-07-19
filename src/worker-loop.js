@@ -2,6 +2,9 @@
 
 const { spawn } = require('child_process');
 const logger = require('./logger');
+const {
+  recoverOrphanedRunningBatchesOnce,
+} = require('./orphaned-batch-recovery');
 
 const enabled = String(process.env.DIRECT_DISPATCHER_WORKER_ENABLED || 'false').toLowerCase() === 'true';
 const intervalMs = Number.parseInt(process.env.DIRECT_DISPATCHER_WORKER_INTERVAL_MS || '30000', 10);
@@ -20,6 +23,7 @@ let shutdownSignal = null;
 let shutdownTimer = null;
 let initialTopUpTimer = null;
 let intervalHandle = null;
+let topUpInProgress = false;
 const activeChildren = new Set();
 
 function exitIfShutdownDrained() {
@@ -166,20 +170,46 @@ function runExecutorOnce() {
   return true;
 }
 
-function topUpWorkers() {
-  if (!enabled || shutdownRequested) return;
+async function topUpWorkers() {
+  if (!enabled || shutdownRequested || topUpInProgress) return;
 
-  while (activeWorkers < workerConcurrency) {
-    const spawned = runExecutorOnce();
-    if (!spawned) break;
+  topUpInProgress = true;
+
+  try {
+    const recoveredBatches = await recoverOrphanedRunningBatchesOnce();
+
+    if (recoveredBatches > 0) {
+      logger.warn('worker_loop.orphaned_batches_recovered', {
+        recovered_batches: recoveredBatches,
+      });
+    }
+
+    while (activeWorkers < workerConcurrency) {
+      const spawned = runExecutorOnce();
+      if (!spawned) break;
+    }
+  } catch (error) {
+    logger.error('worker_loop.orphaned_batch_recovery_failed', {
+      error: {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+      },
+    });
+  } finally {
+    topUpInProgress = false;
   }
 }
 
 if (enabled) {
   logger.info('worker_loop.started', { intervalMs, workerConcurrency, shutdownGraceMs });
 
-  initialTopUpTimer = setTimeout(topUpWorkers, 5000);
-  intervalHandle = setInterval(topUpWorkers, intervalMs);
+  initialTopUpTimer = setTimeout(() => {
+    void topUpWorkers();
+  }, 5000);
+  intervalHandle = setInterval(() => {
+    void topUpWorkers();
+  }, intervalMs);
 } else {
   logger.info('worker_loop.disabled');
 }
