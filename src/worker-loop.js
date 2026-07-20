@@ -5,6 +5,9 @@ const logger = require('./logger');
 const {
   recoverOrphanedRunningBatchesOnce,
 } = require('./orphaned-batch-recovery');
+const {
+  emitNoBatchDiagnosticOnce,
+} = require('./worker-no-batch-diagnostics');
 
 const enabled = String(process.env.DIRECT_DISPATCHER_WORKER_ENABLED || 'false').toLowerCase() === 'true';
 const intervalMs = Number.parseInt(process.env.DIRECT_DISPATCHER_WORKER_INTERVAL_MS || '30000', 10);
@@ -109,6 +112,10 @@ function forwardExecutorLine(stream, line, pid) {
     const parsed = JSON.parse(trimmed);
     const { level, message, ts, ...rest } = parsed;
     const logLevel = typeof logger[level] === 'function' ? level : stream === 'stderr' ? 'warn' : 'info';
+
+    if (message === 'relay_executor.no_batch') {
+      void emitNoBatchDiagnosticOnce();
+    }
 
     logger[logLevel](message || `worker_loop.executor_${stream}`, {
       ...rest,
