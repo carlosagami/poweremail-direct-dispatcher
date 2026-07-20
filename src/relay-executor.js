@@ -60,6 +60,40 @@ function getBatchHeartbeatMs(config) {
   return Math.max(Number(config.batchHeartbeatMs || 30000), 1000);
 }
 
+function resolveMaxMsgsPerSecond(config, batch) {
+  const forcedRate = Number(config.forceMaxMsgsPerSecond || 0);
+  const requestedRate = Number(batch?.requested_msgs_per_second || 0);
+  const configuredRate = Number(config.maxMsgsPerSecond || 1);
+
+  if (forcedRate > 0) {
+    return {
+      value: forcedRate,
+      source: "env_force",
+      configured: configuredRate,
+      requested: requestedRate > 0 ? requestedRate : null,
+      forced: forcedRate,
+    };
+  }
+
+  if (requestedRate > 0) {
+    return {
+      value: requestedRate,
+      source: "campaign_dispatch_queue",
+      configured: configuredRate,
+      requested: requestedRate,
+      forced: null,
+    };
+  }
+
+  return {
+    value: configuredRate,
+    source: "service_env_default",
+    configured: configuredRate,
+    requested: requestedRate > 0 ? requestedRate : null,
+    forced: null,
+  };
+}
+
 function isBatchEmptyError(err) {
   return err?.message === BATCH_EMPTY_ERROR_MESSAGE;
 }
@@ -1144,6 +1178,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       smtp_max_messages: smtpMaxMessages,
       progress_every_n_recipients: progressEvery,
       batch_heartbeat_ms: heartbeatMs,
+      max_msgs_per_second: Number(config.maxMsgsPerSecond),
+      max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+      campaign_requested_msgs_per_second:
+        config.campaignRequestedMsgsPerSecond ?? null,
+      configured_max_msgs_per_second:
+        config.configuredMaxMsgsPerSecond ?? null,
+      forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
     }
   );
 
@@ -1169,6 +1210,12 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
     progress_every_n_recipients: progressEvery,
     batch_heartbeat_ms: heartbeatMs,
     max_msgs_per_second: Number(config.maxMsgsPerSecond),
+    max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+    campaign_requested_msgs_per_second:
+      config.campaignRequestedMsgsPerSecond ?? null,
+    configured_max_msgs_per_second:
+      config.configuredMaxMsgsPerSecond ?? null,
+    forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
   });
 
   logger.info("relay_executor.batch_started", {
@@ -1308,6 +1355,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         smtp_max_connections: smtpMaxConnections,
         progress_every_n_recipients: progressEvery,
         batch_heartbeat_ms: heartbeatMs,
+        max_msgs_per_second: Number(config.maxMsgsPerSecond),
+        max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+        campaign_requested_msgs_per_second:
+          config.campaignRequestedMsgsPerSecond ?? null,
+        configured_max_msgs_per_second:
+          config.configuredMaxMsgsPerSecond ?? null,
+        forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
       }
     );
 
@@ -1344,6 +1398,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
           smtp_max_connections: smtpMaxConnections,
           progress_every_n_recipients: progressEvery,
           batch_heartbeat_ms: heartbeatMs,
+          max_msgs_per_second: Number(config.maxMsgsPerSecond),
+          max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+          campaign_requested_msgs_per_second:
+            config.campaignRequestedMsgsPerSecond ?? null,
+          configured_max_msgs_per_second:
+            config.configuredMaxMsgsPerSecond ?? null,
+          forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
         }
       );
 
@@ -1402,6 +1463,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
             smtp_max_connections: smtpMaxConnections,
             progress_every_n_recipients: progressEvery,
             batch_heartbeat_ms: heartbeatMs,
+            max_msgs_per_second: Number(config.maxMsgsPerSecond),
+            max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+            campaign_requested_msgs_per_second:
+              config.campaignRequestedMsgsPerSecond ?? null,
+            configured_max_msgs_per_second:
+              config.configuredMaxMsgsPerSecond ?? null,
+            forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
           }
         );
       } catch (attemptErr) {
@@ -1476,6 +1544,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
             smtp_max_connections: smtpMaxConnections,
             progress_every_n_recipients: progressEvery,
             batch_heartbeat_ms: heartbeatMs,
+            max_msgs_per_second: Number(config.maxMsgsPerSecond),
+            max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+            campaign_requested_msgs_per_second:
+              config.campaignRequestedMsgsPerSecond ?? null,
+            configured_max_msgs_per_second:
+              config.configuredMaxMsgsPerSecond ?? null,
+            forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
           }
         );
       } catch (attemptErr) {
@@ -1548,6 +1623,13 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
         smtp_max_connections: smtpMaxConnections,
         progress_every_n_recipients: progressEvery,
         batch_heartbeat_ms: heartbeatMs,
+        max_msgs_per_second: Number(config.maxMsgsPerSecond),
+        max_msgs_per_second_source: config.maxMsgsPerSecondSource || null,
+        campaign_requested_msgs_per_second:
+          config.campaignRequestedMsgsPerSecond ?? null,
+        configured_max_msgs_per_second:
+          config.configuredMaxMsgsPerSecond ?? null,
+        forced_max_msgs_per_second: config.forcedMaxMsgsPerSecond ?? null,
       }
     );
 
@@ -1592,12 +1674,14 @@ async function main() {
       return;
     }
 
+    const pacing = resolveMaxMsgsPerSecond(config, batch);
     const runConfig = {
       ...config,
-      maxMsgsPerSecond:
-        Number(batch.requested_msgs_per_second) > 0
-          ? Number(batch.requested_msgs_per_second)
-          : Number(config.maxMsgsPerSecond),
+      maxMsgsPerSecond: pacing.value,
+      maxMsgsPerSecondSource: pacing.source,
+      campaignRequestedMsgsPerSecond: pacing.requested,
+      configuredMaxMsgsPerSecond: pacing.configured,
+      forcedMaxMsgsPerSecond: pacing.forced,
     };
     config = runConfig;
 

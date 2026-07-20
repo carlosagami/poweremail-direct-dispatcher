@@ -27,6 +27,23 @@ This pack is the next implementation step for the robust path:
 6. Validate outputs in `control_plane`
 7. Switch executor to `smtp-relay` for a single pilot tenant
 
+## Rate precedence
+
+The dispatcher now supports an explicit operational override for pacing.
+
+Relevant envs:
+
+- `DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND`: service-level default pacing
+- `DIRECT_DISPATCHER_FORCE_MAX_MSGS_PER_SECOND`: emergency override that wins over campaign-level pacing
+
+Effective precedence during execution:
+
+1. `DIRECT_DISPATCHER_FORCE_MAX_MSGS_PER_SECOND`
+2. `control_plane.campaign_dispatch_queue.requested_msgs_per_second`
+3. `DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND`
+
+This is meant for live operational recovery when a campaign queue row is already persisted with an outdated pacing value.
+
 ## Notes
 
 - This pack intentionally targets `broadcast` first.
