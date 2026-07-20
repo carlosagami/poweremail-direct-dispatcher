@@ -11,6 +11,10 @@ const progressEvery = Math.max(
   Number.parseInt(process.env.DIRECT_DISPATCHER_PROGRESS_EVERY_N_RECIPIENTS || '25', 10),
   1
 );
+const intraBatchConcurrency = Math.max(
+  Number.parseInt(process.env.DIRECT_DISPATCHER_INTRA_BATCH_CONCURRENCY || '2', 10),
+  1
+);
 
 const state = {
   sendyCampaignId: null,
@@ -84,6 +88,7 @@ function emitBatchHeartbeat(reason) {
       state.transportConfig.configured_max_msgs_per_second ?? null,
     forced_max_msgs_per_second:
       state.transportConfig.forced_max_msgs_per_second ?? null,
+    intra_batch_concurrency: intraBatchConcurrency,
   });
 }
 
@@ -224,6 +229,7 @@ nodemailer.createTransport = function patchedCreateTransport(...args) {
             elapsedMs,
             getObservedSent()
           ),
+          intra_batch_concurrency: intraBatchConcurrency,
         });
       }
 
@@ -244,6 +250,7 @@ nodemailer.createTransport = function patchedCreateTransport(...args) {
         send_duration_ms: durationMs,
         error_code: error?.code || null,
         error_message: error?.message || null,
+        intra_batch_concurrency: intraBatchConcurrency,
       });
 
       throw error;

@@ -168,7 +168,13 @@ function runExecutorOnce() {
 
   const child = spawn(
     process.execPath,
-    ['-r', './src/relay-executor-live-instrumentation.js', 'src/relay-executor.js'],
+    [
+      '-r',
+      './src/relay-executor-controlled-concurrency.js',
+      '-r',
+      './src/relay-executor-live-instrumentation.js',
+      'src/relay-executor.js',
+    ],
     {
       cwd: process.cwd(),
       env: process.env,
