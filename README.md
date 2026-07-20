@@ -12,6 +12,7 @@ This pack is the next implementation step for the robust path:
 - `docs/architecture.md`: target architecture and component responsibilities
 - `docs/implementation-runbook.md`: rollout sequence and operator checklist
 - `docs/live-diagnostics-runbook.md`: operational diagnosis for pacing, resets, throughput checks, and live log interpretation
+- `docs/relay-executor-latency-heartbeat-plan.md`: next instrumentation step for measuring per-send latency and adding heartbeat diagnostics
 - `sql/001_direct_dispatch_schema.sql`: additive schema for direct broadcast dispatch
 - `src/campaign-intake.js`: copies an approved Sendy campaign into `control_plane`
 - `src/audience-resolver.js`: snapshots the audience outside Sendy and seeds recipient queue
@@ -54,6 +55,7 @@ New observability behavior:
 - `worker_loop` forwards child stdout and stderr lines as first-class logs
 - `relay_executor.transport_config` remains the canonical source for effective pacing resolution and SMTP pool settings
 - `docs/live-diagnostics-runbook.md` is the operating runbook for resets, throughput measurement, and rate interpretation
+- `docs/relay-executor-latency-heartbeat-plan.md` defines the next instrumentation step for measuring where the SMTP loop spends time
 
 This is meant to shorten live diagnosis when a batch looks stalled, under-paced, or falsely orphaned.
 
