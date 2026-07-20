@@ -101,6 +101,58 @@ function requestShutdown(signal) {
 process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 process.on('SIGINT', () => requestShutdown('SIGINT'));
 
+function forwardExecutorLine(stream, line, pid) {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const { level, message, ts, ...rest } = parsed;
+    const logLevel = typeof logger[level] === 'function' ? level : stream === 'stderr' ? 'warn' : 'info';
+
+    logger[logLevel](message || `worker_loop.executor_${stream}`, {
+      ...rest,
+      executor_ts: ts || null,
+      executor_stream: stream,
+      executor_pid: pid,
+    });
+    return;
+  } catch (_) {
+    // Fall back to plain-text forwarding when the child line is not JSON.
+  }
+
+  const fallbackLevel = stream === 'stderr' ? 'warn' : 'info';
+  logger[fallbackLevel](`worker_loop.executor_${stream}`, {
+    executor_stream: stream,
+    executor_pid: pid,
+    line: trimmed,
+  });
+}
+
+function wireStreamForwarding(stream, streamName, pid, onChunk) {
+  let buffer = '';
+
+  stream.on('data', (chunk) => {
+    const text = chunk.toString();
+    onChunk(text);
+    buffer += text;
+
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      forwardExecutorLine(streamName, line, pid);
+      newlineIndex = buffer.indexOf('\n');
+    }
+  });
+
+  stream.on('end', () => {
+    if (buffer.trim()) {
+      forwardExecutorLine(streamName, buffer, pid);
+    }
+  });
+}
+
 function runExecutorOnce() {
   if (!enabled || shutdownRequested) return false;
 
@@ -124,12 +176,12 @@ function runExecutorOnce() {
   let stdout = '';
   let stderr = '';
 
-  child.stdout.on('data', (chunk) => {
-    stdout += chunk.toString();
+  wireStreamForwarding(child.stdout, 'stdout', child.pid, (text) => {
+    stdout += text;
   });
 
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
+  wireStreamForwarding(child.stderr, 'stderr', child.pid, (text) => {
+    stderr += text;
   });
 
   child.on('error', (error) => {
@@ -156,6 +208,7 @@ function runExecutorOnce() {
       stderr: stderr.trim(),
       activeWorkers,
       workerConcurrency,
+      executor_pid: child.pid,
     };
 
     if (code === 0) {
