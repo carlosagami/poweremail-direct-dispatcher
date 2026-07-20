@@ -166,11 +166,15 @@ function runExecutorOnce() {
 
   activeWorkers += 1;
 
-  const child = spawn(process.execPath, ['src/relay-executor.js'], {
-    cwd: process.cwd(),
-    env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const child = spawn(
+    process.execPath,
+    ['-r', './src/relay-executor-live-instrumentation.js', 'src/relay-executor.js'],
+    {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
   activeChildren.add(child);
 
   let stdout = '';
