@@ -44,6 +44,17 @@ Effective precedence during execution:
 
 This is meant for live operational recovery when a campaign queue row is already persisted with an outdated pacing value.
 
+## Live diagnostics
+
+The dispatcher now emits executor logs in real time from the worker loop instead of waiting for process exit.
+
+New observability behavior:
+
+- `worker_loop` forwards child stdout and stderr lines as first-class logs
+- `relay_executor.transport_config` remains the canonical source for effective pacing resolution and SMTP pool settings
+
+This is meant to shorten live diagnosis when a batch looks stalled, under-paced, or falsely orphaned.
+
 ## Notes
 
 - This pack intentionally targets `broadcast` first.
