@@ -8,10 +8,105 @@ function csvPlaceholders(values) {
   return values.map(() => "?").join(",");
 }
 
+function chunkArray(items, chunkSize) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+function buildRecipientInsertChunk(registry, audienceSnapshotId, sendyCampaignId, recipientsChunk) {
+  const values = [];
+  const placeholders = recipientsChunk.map((recipient, index) => {
+    const offset = index * 9;
+    values.push(
+      registry.dispatch_campaign_id,
+      audienceSnapshotId,
+      registry.tenant_id,
+      sendyCampaignId,
+      recipient.sendy_subscriber_id,
+      recipient.sendy_list_id || null,
+      recipient.email,
+      recipient.name || null,
+      recipient.custom_fields
+        ? JSON.stringify(recipient.custom_fields)
+        : JSON.stringify({})
+    );
+
+    return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}::jsonb, 'queued')`;
+  });
+
+  return {
+    text: `
+      INSERT INTO control_plane.campaign_recipient_queue (
+        dispatch_campaign_id,
+        audience_snapshot_id,
+        tenant_id,
+        sendy_campaign_id,
+        sendy_subscriber_id,
+        sendy_list_id,
+        email,
+        subscriber_name,
+        custom_fields_json,
+        recipient_state
+      )
+      VALUES ${placeholders.join(",\n             ")}
+      ON CONFLICT (dispatch_campaign_id, email) DO NOTHING
+    `,
+    values,
+  };
+}
+
+async function insertRecipientsInChunks(client, config, registry, audienceSnapshotId, recipients) {
+  const chunks = chunkArray(recipients, config.importChunkSize);
+  let importedCount = 0;
+
+  logger.info("audience_resolver.import_started", {
+    tenant_key: registry.tenant_key,
+    sendy_campaign_id: registry.sendy_campaign_id,
+    dispatch_campaign_id: registry.dispatch_campaign_id,
+    audience_snapshot_id: audienceSnapshotId,
+    received_recipients: recipients.length,
+    chunk_size: config.importChunkSize,
+    chunk_count: chunks.length,
+  });
+
+  for (const [index, recipientsChunk] of chunks.entries()) {
+    const statement = buildRecipientInsertChunk(
+      registry,
+      audienceSnapshotId,
+      config.sendyCampaignId,
+      recipientsChunk
+    );
+    const insertResult = await client.query(statement.text, statement.values);
+    importedCount += Number(insertResult.rowCount || 0);
+
+    logger.info("audience_resolver.import_chunk_completed", {
+      tenant_key: registry.tenant_key,
+      sendy_campaign_id: registry.sendy_campaign_id,
+      dispatch_campaign_id: registry.dispatch_campaign_id,
+      audience_snapshot_id: audienceSnapshotId,
+      chunk_number: index + 1,
+      chunk_size: recipientsChunk.length,
+      chunk_imported: Number(insertResult.rowCount || 0),
+      imported_recipients: importedCount,
+      received_recipients: recipients.length,
+      duplicate_recipients: Math.max(recipients.length - importedCount, 0),
+    });
+  }
+
+  return {
+    receivedCount: recipients.length,
+    importedCount,
+    duplicateCount: Math.max(recipients.length - importedCount, 0),
+  };
+}
+
 async function loadRegistry(cpDb, sendyCampaignId, tenantKey) {
   const { rows } = await cpDb.query(
     `
-    SELECT dispatch_campaign_id, tenant_id, sendy_snapshot_json
+    SELECT dispatch_campaign_id, tenant_id, tenant_key, sendy_campaign_id, sendy_snapshot_json
     FROM control_plane.sendy_campaign_registry
     WHERE sendy_campaign_id = $1
       AND tenant_key = $2
@@ -165,40 +260,13 @@ async function main() {
         [registry.dispatch_campaign_id]
       );
 
-      for (const recipient of recipients) {
-        await client.query(
-          `
-          INSERT INTO control_plane.campaign_recipient_queue (
-            dispatch_campaign_id,
-            audience_snapshot_id,
-            tenant_id,
-            sendy_campaign_id,
-            sendy_subscriber_id,
-            sendy_list_id,
-            email,
-            subscriber_name,
-            custom_fields_json,
-            recipient_state
-          )
-          VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued'
-          )
-          `,
-          [
-            registry.dispatch_campaign_id,
-            audienceSnapshotId,
-            registry.tenant_id,
-            config.sendyCampaignId,
-            recipient.sendy_subscriber_id,
-            recipient.sendy_list_id || null,
-            recipient.email,
-            recipient.name || null,
-            recipient.custom_fields
-              ? JSON.stringify(recipient.custom_fields)
-              : JSON.stringify({}),
-          ]
-        );
-      }
+      const importSummary = await insertRecipientsInChunks(
+        client,
+        config,
+        registry,
+        audienceSnapshotId,
+        recipients
+      );
 
       await client.query(
         `
@@ -211,7 +279,7 @@ async function main() {
         [registry.dispatch_campaign_id, audienceSnapshotId]
       );
 
-      return { audienceSnapshotId };
+      return { audienceSnapshotId, ...importSummary };
     });
 
     logger.info("audience_resolver.completed", {
@@ -219,7 +287,9 @@ async function main() {
       sendy_campaign_id: config.sendyCampaignId,
       dispatch_campaign_id: registry.dispatch_campaign_id,
       audience_snapshot_id: result.audienceSnapshotId,
-      recipients: recipients.length,
+      received_recipients: result.receivedCount,
+      imported_recipients: result.importedCount,
+      duplicate_recipients: result.duplicateCount,
     });
   } catch (err) {
     logger.error("audience_resolver.failed", { error: chunkError(err) });
