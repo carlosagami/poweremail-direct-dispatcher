@@ -62,6 +62,7 @@ function loadServiceConfig() {
     sendyMysqlPassword: requireEnv("SENDY_MYSQL_PASSWORD"),
     sendyAppPath: process.env.SENDY_APP_PATH || "",
     batchSize: intEnv("DIRECT_DISPATCHER_BATCH_SIZE", 250),
+    importChunkSize: intEnv("DIRECT_DISPATCHER_IMPORT_CHUNK_SIZE", 500),
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
     maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
     forceMaxMsgsPerSecond: floatEnv(
