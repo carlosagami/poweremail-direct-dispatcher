@@ -23,4 +23,5 @@ export TEST_ORCHESTRATOR_ID_SALT="${TEST_ORCHESTRATOR_ID_SALT:-daily-$(TZ=Americ
 exec node \
   -r ./src/test-mail-copy-ai-guard.js \
   -r ./src/test-mail-local-copy-quality-guard.js \
+  -r ./src/test-mail-shopology-recipient-coverage-guard.js \
   src/test-mail-orchestrator.js
