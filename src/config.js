@@ -64,6 +64,7 @@ function loadServiceConfig() {
     batchSize: intEnv("DIRECT_DISPATCHER_BATCH_SIZE", 250),
     importChunkSize: intEnv("DIRECT_DISPATCHER_IMPORT_CHUNK_SIZE", 500),
     executionMode: process.env.DIRECT_DISPATCHER_EXECUTION_MODE || "dry-run",
+    tenantPauseEnabled: boolEnv("DIRECT_DISPATCHER_TENANT_PAUSE_ENABLED", false),
     maxMsgsPerSecond: floatEnv("DIRECT_DISPATCHER_MAX_MSGS_PER_SECOND", 1),
     forceMaxMsgsPerSecond: floatEnv(
       "DIRECT_DISPATCHER_FORCE_MAX_MSGS_PER_SECOND",
