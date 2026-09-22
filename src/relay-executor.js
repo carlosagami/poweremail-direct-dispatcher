@@ -1317,7 +1317,7 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
           sentCount,
           plannedCount
         );
-        return;
+        return { paused: true, sent: sentCount };
       }
 
       await cpDb.query(
@@ -1462,6 +1462,8 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
       planned: plannedCount,
       batch_state: batchState,
     });
+
+    return { paused: false, sent: sentCount };
   } catch (err) {
     if (isShutdownRequestedError(err)) {
       await requeueBatchForShutdown(cpDb, batch);
@@ -1889,8 +1891,27 @@ async function main() {
     }
 
     if (config.executionMode === "smtp-relay") {
-      await executeSmtpRelay(cpDb, runConfig, batch, recipients, content);
+      const smtpResult = await executeSmtpRelay(
+        cpDb,
+        runConfig,
+        batch,
+        recipients,
+        content
+      );
       await closeDispatchIfDone(cpDb, batch);
+
+      if (smtpResult?.paused) {
+        logger.warn("relay_executor.paused", {
+          execution_mode: "smtp-relay",
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          sent_before_pause: smtpResult.sent,
+        });
+        return;
+      }
+
       logger.info("relay_executor.completed", {
         execution_mode: "smtp-relay",
         sendy_campaign_id: batch.sendy_campaign_id,
