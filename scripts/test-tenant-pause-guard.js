@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   assertTenantPauseInfrastructure,
   isTenantPaused,
@@ -87,6 +89,44 @@ async function main() {
     await assert.rejects(
       assertTenantPauseInfrastructure(db, true),
       /tenant_dispatch_settings is missing/,
+    );
+  }
+
+  {
+    const executor = fs.readFileSync(
+      path.join(process.cwd(), 'src/relay-executor.js'),
+      'utf8',
+    );
+    const config = fs.readFileSync(
+      path.join(process.cwd(), 'src/config.js'),
+      'utf8',
+    );
+    const envExample = fs.readFileSync(
+      path.join(process.cwd(), '.env.example'),
+      'utf8',
+    );
+
+    for (const marker of [
+      'assertTenantPauseInfrastructure',
+      'pausedTenantQueuePredicate',
+      'relay_executor.batch_skipped_tenant_paused',
+      'relay_executor.batch_paused_by_tenant_control',
+      'TENANT_PAUSED',
+      'isTenantPaused(',
+    ]) {
+      assert.ok(
+        executor.includes(marker),
+        `relay-executor tenant pause marker missing: ${marker}`,
+      );
+    }
+
+    assert.ok(
+      config.includes('DIRECT_DISPATCHER_TENANT_PAUSE_ENABLED'),
+      'config feature flag missing',
+    );
+    assert.ok(
+      envExample.includes('DIRECT_DISPATCHER_TENANT_PAUSE_ENABLED=false'),
+      'tenant pause feature must default false',
     );
   }
 
