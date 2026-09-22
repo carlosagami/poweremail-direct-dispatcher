@@ -5,6 +5,11 @@ const { createControlPlaneDb } = require("./db");
 const logger = require("./logger");
 const { chunkError } = require("./utils");
 const { personalizeText } = require("./personalize");
+const {
+  assertTenantPauseInfrastructure,
+  isTenantPaused,
+  pausedTenantQueuePredicate,
+} = require("./tenant-pause");
 
 const BATCH_EMPTY_ERROR_CODE = "BATCH_EMPTY";
 const BATCH_EMPTY_ERROR_MESSAGE = "Batch has no batched recipients";
@@ -16,6 +21,7 @@ const STALE_BATCH_REQUEUED_CODE = "STALE_BATCH_REQUEUED";
 const WORKER_SHUTDOWN_CODE = "WORKER_SHUTDOWN";
 const CONTROL_PLANE_PERSIST_RETRY_CODE = "CONTROL_PLANE_PERSIST_RETRY";
 const SMTP_RELAY_RETRY_CODE = "SMTP_RELAY_RETRY";
+const TENANT_PAUSED_CODE = "TENANT_PAUSED";
 
 let shutdownRequested = false;
 let shutdownSignal = null;
@@ -504,8 +510,16 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
   });
 }
 
-async function claimNextQueuedBatch(cpDb, staleBatchTimeoutMs) {
+async function claimNextQueuedBatch(
+  cpDb,
+  staleBatchTimeoutMs,
+  tenantPauseEnabled
+) {
   await recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs);
+  const pausePredicate = pausedTenantQueuePredicate(
+    tenantPauseEnabled,
+    "q"
+  );
 
   return cpDb.tx(async (client) => {
     const queueResult = await client.query(
@@ -524,6 +538,7 @@ async function claimNextQueuedBatch(cpDb, staleBatchTimeoutMs) {
           WHERE active_batches.dispatch_campaign_id = q.dispatch_campaign_id
             AND active_batches.batch_state IN ('reserved', 'running')
         )
+        ${pausePredicate}
       ORDER BY
         CASE q.queue_state
           WHEN 'running' THEN 0
@@ -983,6 +998,60 @@ async function finishBatchOrRequeue(db, batch) {
   return "completed";
 }
 
+async function releaseBatchForTenantPause(cpDb, batch) {
+  await cpDb.query(
+    `
+    UPDATE control_plane.campaign_delivery_batches
+       SET batch_state = 'queued',
+           started_at = NULL,
+           updated_at = now()
+     WHERE delivery_batch_id = $1
+       AND batch_state = 'running'
+    `,
+    [batch.delivery_batch_id]
+  );
+}
+
+async function recordTenantPausedAttempt(
+  cpDb,
+  batch,
+  deliveryAttemptId,
+  sentCount,
+  plannedCount
+) {
+  const batchState = await finishBatchOrRequeue(cpDb, batch);
+
+  await updateAttempt(
+    cpDb,
+    deliveryAttemptId,
+    "warn",
+    TENANT_PAUSED_CODE,
+    `Tenant paused after ${sentCount} of ${plannedCount} planned recipients`,
+    {
+      paused: true,
+      sent: sentCount,
+      planned: plannedCount,
+      remaining: Math.max(plannedCount - sentCount, 0),
+      batch_state: batchState,
+      batch_key: batch.batch_key,
+    }
+  );
+
+  logger.warn("relay_executor.batch_paused_by_tenant_control", {
+    sendy_campaign_id: batch.sendy_campaign_id,
+    tenant_key: batch.tenant_key,
+    dispatch_campaign_id: batch.dispatch_campaign_id,
+    batch_key: batch.batch_key,
+    delivery_batch_id: batch.delivery_batch_id,
+    delivery_attempt_id: deliveryAttemptId,
+    sent: sentCount,
+    planned: plannedCount,
+    batch_state: batchState,
+  });
+
+  return batchState;
+}
+
 async function closeDispatchIfDone(cpDb, batch) {
   const { rows } = await cpDb.query(
     `
@@ -1233,6 +1302,23 @@ async function executeSmtpRelay(cpDb, config, batch, recipients, content) {
 
     for (const recipient of recipients) {
       throwIfShutdownRequested();
+
+      if (
+        await isTenantPaused(
+          cpDb,
+          batch.tenant_id,
+          config.tenantPauseEnabled
+        )
+      ) {
+        await recordTenantPausedAttempt(
+          cpDb,
+          batch,
+          deliveryAttemptId,
+          sentCount,
+          plannedCount
+        );
+        return;
+      }
 
       await cpDb.query(
         `
@@ -1661,15 +1747,49 @@ async function main() {
   let batch = null;
 
   try {
+    const pauseInfrastructure = await assertTenantPauseInfrastructure(
+      cpDb,
+      config.tenantPauseEnabled
+    );
+
+    if (pauseInfrastructure.enabled) {
+      logger.info("relay_executor.tenant_pause_guard_enabled", {
+        schema_ready: pauseInfrastructure.schemaReady,
+      });
+    }
+
     batch = hasExplicitCampaign
       ? await loadBatchByCampaign(cpDb, config.sendyCampaignId, config.tenantKey)
-      : await claimNextQueuedBatch(cpDb, config.staleBatchTimeoutMs);
+      : await claimNextQueuedBatch(
+          cpDb,
+          config.staleBatchTimeoutMs,
+          config.tenantPauseEnabled
+        );
 
     if (!batch) {
       logger.warn("relay_executor.no_batch", {
         mode: hasExplicitCampaign ? "targeted" : "queue",
         sendy_campaign_id: hasExplicitCampaign ? config.sendyCampaignId : null,
         tenant_key: hasExplicitCampaign ? config.tenantKey : null,
+      });
+      return;
+    }
+
+    if (
+      await isTenantPaused(
+        cpDb,
+        batch.tenant_id,
+        config.tenantPauseEnabled
+      )
+    ) {
+      await releaseBatchForTenantPause(cpDb, batch);
+      logger.warn("relay_executor.batch_skipped_tenant_paused", {
+        mode: hasExplicitCampaign ? "targeted" : "queue",
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
       });
       return;
     }
@@ -1716,9 +1836,45 @@ async function main() {
       throw new Error("Content snapshot not found");
     }
 
+    if (
+      await isTenantPaused(
+        cpDb,
+        batch.tenant_id,
+        config.tenantPauseEnabled
+      )
+    ) {
+      await releaseBatchForTenantPause(cpDb, batch);
+      logger.warn("relay_executor.batch_paused_before_execution", {
+        execution_mode: config.executionMode,
+        sendy_campaign_id: batch.sendy_campaign_id,
+        tenant_key: batch.tenant_key,
+        dispatch_campaign_id: batch.dispatch_campaign_id,
+        batch_key: batch.batch_key,
+        delivery_batch_id: batch.delivery_batch_id,
+      });
+      return;
+    }
+
     await markDispatchRunning(cpDb, batch);
 
     if (config.executionMode === "dry-run") {
+      if (
+        await isTenantPaused(
+          cpDb,
+          batch.tenant_id,
+          config.tenantPauseEnabled
+        )
+      ) {
+        await releaseBatchForTenantPause(cpDb, batch);
+        logger.warn("relay_executor.dry_run_paused_before_batch", {
+          sendy_campaign_id: batch.sendy_campaign_id,
+          tenant_key: batch.tenant_key,
+          dispatch_campaign_id: batch.dispatch_campaign_id,
+          batch_key: batch.batch_key,
+          delivery_batch_id: batch.delivery_batch_id,
+        });
+        return;
+      }
       await executeDryRun(cpDb, batch, recipients);
       await closeDispatchIfDone(cpDb, batch);
       logger.info("relay_executor.completed", {
