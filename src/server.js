@@ -86,6 +86,48 @@ function httpError(statusCode, message, details = {}) {
   return error;
 }
 
+async function tenantDomainSwitchFreeze(client, tenantId) {
+  const schema = await client.query(
+    `SELECT to_regclass('control_plane.tenant_domain_switch_freezes')::text AS table_name`
+  );
+
+  if (!schema.rows[0]?.table_name) return null;
+
+  const result = await client.query(
+    `
+    SELECT
+      operation_id::text,
+      reason,
+      acquired_by,
+      acquired_at
+    FROM control_plane.tenant_domain_switch_freezes
+    WHERE tenant_id = $1
+      AND state = 'ACTIVE'
+    ORDER BY acquired_at DESC
+    LIMIT 1
+    `,
+    [tenantId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function assertTenantDispatchNotFrozen(client, tenant) {
+  const freeze = await tenantDomainSwitchFreeze(client, tenant.tenant_id);
+  if (!freeze) return;
+
+  throw httpError(
+    409,
+    'Tenant dispatch is temporarily frozen for a domain switch',
+    {
+      code: 'TENANT_DOMAIN_SWITCH_FROZEN',
+      tenant_key: tenant.tenant_key,
+      operation_id: freeze.operation_id,
+      acquired_at: freeze.acquired_at,
+    }
+  );
+}
+
 function assertAuthorized(req) {
   const expected = process.env.DIRECT_DISPATCHER_HANDOFF_TOKEN;
   if (!expected) {
@@ -1440,6 +1482,8 @@ async function handleSnapshotHandoff(req, res, config) {
       const requestedTenant = await findTenant(client, tenantKey);
       const senderTenant = await resolveTenantFromSender(client, campaignFromEmail);
       const tenant = senderTenant || requestedTenant;
+
+      await assertTenantDispatchNotFrozen(client, tenant);
 
       if (senderTenant && senderTenant.tenant_key !== requestedTenant.tenant_key) {
         logger.warn("snapshot_handoff.tenant_overridden_by_sender", {
