@@ -227,7 +227,28 @@ function getRecipientSenderOverride(recipient) {
     : null;
 }
 
+async function domainSwitchFreezeTableReady(cpDb) {
+  const { rows } = await cpDb.query(
+    `SELECT to_regclass('control_plane.tenant_domain_switch_freezes') IS NOT NULL AS ready`
+  );
+  return rows[0]?.ready === true;
+}
+
+function tenantFreezeExclusionSql(tenantExpression, freezeReady) {
+  if (!freezeReady) return '';
+  return `
+        AND NOT EXISTS (
+          SELECT 1
+          FROM control_plane.tenant_domain_switch_freezes switch_freeze
+          WHERE switch_freeze.tenant_id = ${tenantExpression}
+            AND switch_freeze.state = 'ACTIVE'
+        )`;
+}
+
 async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
+  const freezeReady = await domainSwitchFreezeTableReady(cpDb);
+  const freezeExclusion = tenantFreezeExclusionSql('c.tenant_id', freezeReady);
+
   const { rows } = await cpDb.query(
     `
     SELECT
@@ -253,6 +274,7 @@ async function loadBatchByCampaign(cpDb, sendyCampaignId, tenantKey) {
     WHERE r.sendy_campaign_id = $1
       AND r.tenant_key = $2
       AND b.batch_state = 'queued'
+      ${freezeExclusion}
     ORDER BY b.delivery_batch_id ASC
     LIMIT 1
     `,
@@ -506,6 +528,8 @@ async function recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs) {
 
 async function claimNextQueuedBatch(cpDb, staleBatchTimeoutMs) {
   await recoverStaleRunningBatches(cpDb, staleBatchTimeoutMs);
+  const freezeReady = await domainSwitchFreezeTableReady(cpDb);
+  const freezeExclusion = tenantFreezeExclusionSql('q.tenant_id', freezeReady);
 
   return cpDb.tx(async (client) => {
     const queueResult = await client.query(
@@ -518,6 +542,7 @@ async function claimNextQueuedBatch(cpDb, staleBatchTimeoutMs) {
         q.requested_msgs_per_second
       FROM control_plane.campaign_dispatch_queue q
       WHERE q.queue_state IN ('queued', 'reserved', 'launching', 'retry_wait', 'running')
+        ${freezeExclusion}
         AND NOT EXISTS (
           SELECT 1
           FROM control_plane.campaign_delivery_batches active_batches
