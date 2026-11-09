@@ -1,0 +1,45 @@
+name: Shopology cron seed parity (synthetic, non-sending)
+
+on:
+  pull_request:
+    paths:
+      - "src/test-mail-orchestrator.js"
+      - "src/server.js"
+      - "src/test-mail-shopology-recipient-coverage-guard.js"
+      - "scripts/run-test-orchestrator-cron.sh"
+      - "test/shopology-recipient-coverage-contract.test.js"
+      - ".github/workflows/shopology-seed-parity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["18.20.5", "24.22.1"]
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+      - name: Use Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Check exact runtime and shell syntax
+        run: |
+          node --version
+          bash -n scripts/run-test-orchestrator-cron.sh
+          node --check src/test-mail-orchestrator.js
+          node --check src/server.js
+          node --check src/test-mail-shopology-recipient-coverage-guard.js
+          node --check test/shopology-recipient-coverage-contract.test.js
+      - name: Verify guard is actually preloaded by cron and server
+        run: |
+          grep -F -- '-r ./src/test-mail-shopology-recipient-coverage-guard.js' scripts/run-test-orchestrator-cron.sh
+          grep -F -- '-r ./src/test-mail-shopology-recipient-coverage-guard.js' package.json
+      - name: Run pure synthetic contract tests (no network / no DB)
+        run: node --test test/shopology-recipient-coverage-contract.test.js
